@@ -8,6 +8,7 @@
 #include "Modules/ModuleManager.h"
 #include "PlayInEditorDataTypes.h"
 #include "Kismet2/DebuggerCommands.h"
+#include "PlaytestBlueprintErrors.h"
 #include "PlaytestLevels.h"
 #include "PlaytestRunInput.h"
 #include "PlaytestSubsystem.h"
@@ -195,6 +196,7 @@ public:
 		{
 			Bridge->SessionHandler = &HandleSession;
 			Bridge->SessionRequested = []() { return GEditor && GEditor->IsPlaySessionRequestQueued(); };
+			Bridge->StartProblem = []() { return GEditor ? PlaytestBlueprintErrors::Describe(!GEditor->PlayWorld) : FString(); };
 			// How many players Play In Editor starts in this editor: Number of Players, when run under one process (else
 			// the others are games of their own, out of the plugin's reach)
 			Bridge->PlaySettingsPlayers = []()
@@ -259,6 +261,7 @@ public:
 			{
 				Bridge->SessionHandler = nullptr;
 				Bridge->SessionRequested = nullptr;
+				Bridge->StartProblem = nullptr;
 				Bridge->PlaySettingsPlayers = nullptr;
 			}
 		}

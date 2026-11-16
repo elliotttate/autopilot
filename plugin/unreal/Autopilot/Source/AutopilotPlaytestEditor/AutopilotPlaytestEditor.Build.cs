@@ -17,6 +17,7 @@ public class AutopilotPlaytestEditor : ModuleRules
 			"Slate",
 			"SlateCore",
 			"UnrealEd",
+			"BlueprintGraph",  // (BlueprintErrorsTests.cpp: a blueprint's nodes)
 			"LevelEditor",
 			"ToolMenus",
 			"WorkspaceMenuStructure",

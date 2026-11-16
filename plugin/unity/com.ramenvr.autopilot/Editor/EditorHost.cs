@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using UnityEditor;
+using UnityEditor.Compilation;
 using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.SceneManagement;
@@ -52,6 +53,9 @@ namespace Autopilot.Playtest.Editor
 
         static readonly List<SessionWait> waits = new List<SessionWait>();
         static int playFrames;
+        // Each assembly's script compile errors from its last compile (a failed compile reloads no scripts, so they
+        // stay here): what a session start says when Unity won't enter play mode for them (StartProblem)
+        static readonly Dictionary<string, List<string>> compileErrors = new Dictionary<string, List<string>>();
 
         static EditorHost()
         {
@@ -68,6 +72,62 @@ namespace Autopilot.Playtest.Editor
             EditorApplication.delayCall += Restore;
             Ops.EditorLevels = Levels;
             Ops.EditorLoading = () => PlayModeLoading;
+            CompilationPipeline.assemblyCompilationFinished += (assembly, messages) =>
+            {
+                var errors = messages.Where(m => m.type == CompilerMessageType.Error).Select(m => m.message).ToList();
+                if (errors.Count > 0) compileErrors[assembly] = errors;
+                else compileErrors.Remove(assembly);
+            };
+        }
+
+        /// <summary>Why play mode can't be entered now, or null: the project's scripts have compile errors, and Unity
+        /// enters no play mode until they are fixed. A session start or restart that would enter it answers 412 with
+        /// it before anything changes, so the run ends saying why rather than waiting for play mode.</summary>
+        internal static string StartProblem()
+        {
+            if (!EditorUtility.scriptCompilationFailed) return null;
+            // (the errors of a compile before this plugin's scripts loaded, the editor opened with them: the Console's)
+            var errors = compileErrors.Count > 0 ? compileErrors.Values.SelectMany(e => e) : ConsoleCompileErrors();
+            var listed = string.Concat(errors.Distinct().Select(e => "\n- " + e));
+            return "The game wasn't started: the project's scripts have compile errors, so Unity won't enter play mode."
+                + (listed.Length > 0 ? listed : " The Console lists them.") + "\nFix them and run again.";
+        }
+
+        /// <summary>The script compile errors the Console shows (its entries flagged as such: LogEntries, which the
+        /// editor keeps internal), each its first line; none when it can't be read.</summary>
+        static List<string> ConsoleCompileErrors()
+        {
+            const int ScriptCompileError = 1 << 11;  // (LogEntry.mode: Unity's kScriptCompileError)
+            var found = new List<string>();
+            var entries = Type.GetType("UnityEditor.LogEntries, UnityEditor");
+            var entryType = Type.GetType("UnityEditor.LogEntry, UnityEditor");
+            var start = entries?.GetMethod("StartGettingEntries");
+            var get = entries?.GetMethod("GetEntryInternal");
+            var end = entries?.GetMethod("EndGettingEntries");
+            var mode = entryType?.GetField("mode");
+            var message = entryType?.GetField("message");
+            if (start == null || get == null || end == null || mode == null || message == null) return found;
+            try
+            {
+                var count = (int)start.Invoke(null, null);
+                var entry = Activator.CreateInstance(entryType);
+                for (var i = 0; i < count; i++)
+                {
+                    get.Invoke(null, new[] { (object)i, entry });
+                    if (((int)mode.GetValue(entry) & ScriptCompileError) == 0) continue;
+                    var text = ((string)message.GetValue(entry) ?? "").Split('\n')[0].Trim();
+                    if (text.Length > 0) found.Add(text);
+                }
+            }
+            catch (Exception)
+            {
+                // (an editor whose Console reads otherwise: the message says to look there)
+            }
+            finally
+            {
+                try { end.Invoke(null, null); } catch (Exception) { }
+            }
+            return found;
         }
 
         // -- the client --------------------------------------------------------------------------------------
@@ -346,6 +406,15 @@ namespace Autopilot.Playtest.Editor
             if (!string.IsNullOrEmpty(map) && action != "stop" && ScenePath(map) == null)
             {
                 client.RespondError(id, $"No scene {map} in the project", 404);  // (before anything changes)
+                return true;
+            }
+            // Play mode entered (a start of a stopped game or of another scene, a restart): not with compile errors
+            var enters = action == "restart" || action == "start" && (!EditorApplication.isPlaying
+                || !string.IsNullOrEmpty(map) && !Ops.IsActiveScene(map) && !Ops.IsActiveScene(ScenePath(map)));
+            var problem = enters ? StartProblem() : null;
+            if (problem != null)
+            {
+                client.RespondError(id, problem, 412);
                 return true;
             }
             switch (action)

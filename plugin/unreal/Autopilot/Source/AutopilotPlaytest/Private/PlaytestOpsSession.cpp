@@ -357,6 +357,18 @@ namespace
 				return;
 			}
 		}
+		// Blueprints with compile errors (the editor's StartProblem): 412 before anything changes, so the run says why
+		// and never waits on the engine's dialog asking whether to play anyway (a game playing on stays as it is)
+		const bool bStarts = Action == TEXT("restart") || (Action == TEXT("start") && (!World || bSwitch));
+		if (bStarts && Bridge.SessionHandler && Bridge.StartProblem)
+		{
+			const FString Problem = Bridge.StartProblem();
+			if (!Problem.IsEmpty())
+			{
+				Bridge.RespondError(Id, Problem, 412);
+				return;
+			}
+		}
 		if (Bridge.SessionHandler)
 		{
 			TWeakObjectPtr<UPlaytestSubsystem> Weak(&Bridge);
