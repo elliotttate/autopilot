@@ -238,7 +238,8 @@ export (a macOS `.app` too), told apart by the files beside it (`Engine.is_build
 which carries the Autopilot plugin (Unreal: not Shipping; Unity: Development Build ticked, or the `AUTOPILOT_PLAYTEST`
 scripting symbol): a release build has no plugin and never connects, which the command reports after
 `--connect-timeout` (180 s), or at once when the game ends first. The game runs headless unless `--watch`, and listens on
-a free port. Nothing else is needed on that machine (no editor, no sign-in, no keys: a replay calls no model), so a QA
+a free port. Nothing else is needed on that machine (no editor, no project) but the decision model a replay asks: a
+sign-in to Aura (`autopilot login`, `--aura`) or a TypeSafe key in autopilot.env (none with `--recorded`), so a QA
 machine or CI replays the regressions exported and committed with the game on each build. Each replay's trace and `results.json` go
 to `--out` (default a new `regress/<time>` folder in Autopilot's settings folder), never into the regressions folder;
 `--events` also prints each step as a line of JSON.
@@ -246,7 +247,7 @@ to `--out` (default a new `regress/<time>` folder in Autopilot's settings folder
 **Autopilot QA** (`autopilot qa`, `autopilot/qa.py`) is a window for QA engineers, in the editor tab's theme. Choose
 the build and the game's Autopilot folder (`<game>/Autopilot`; its `regressions/` folder works too), then:
 - **REPLAY**: press Replay all (or select some and Replay selected), watch each regression come in as OK, FAIL (with
-  why) or FLAKY, read a result's details and the command's log, and open the results folder. It runs `autopilot
+  why) or FLAKY, read a result's details (with what changed) and the command's log, and open the results folder. It runs `autopilot
   regress --build ... --events`.
 - **TEST**: write what to test (a Testing prompt is there to start from), set the time limit, press Run test, follow the
   run's activity, and read its findings and summary when it reports. It runs `autopilot play ... --build ...
@@ -256,16 +257,23 @@ It follows each command's events, so it shows what CI gets, and remembers its ch
 folder.
 
 A replay restarts the level the regression was played on (its `map`: the run's level, else the one the editor played;
-a harness's `start_map` wins) and plays the saved harness through the runtime, as an episode does, but its decisions come
-from the recorded picks (`regress.ReplayJev`): no agent and no Jev are called. It passes when the episode ends in the
-recorded state with the same evidence (booleans, strings and None equal; numbers within the regression's `tolerance`,
-0.25 relative by default), and says why when it doesn't (`ended running (...), not done`, `evidence differs: coins: 1
-then, 2 now`). When and where things happened (evidence keys `t`, `..._t`, `..._at`, and a regression's own
-`ignore` list) move a little on every replay and aren't compared. A replay that fails is played once more
-(`--retries`): one that passes then is reported FLAKY, counted as passed and listed apart, which usually means its
-harness reads the game too tightly. It imports the project's lib.py as it is now, so a change to lib.py that breaks an old verification shows
-(`--frozen-lib`: each regression's own snapshot). `--seconds` caps each episode (default 1.5x the recorded one, at least
-20 s). A build starts in its default map, often a menu: `--level /Game/Maps/Arena` replays a regression saved before
+a harness's `start_map` wins) and plays the saved harness through the runtime, as an episode does, with no agent. Its
+decisions are Jev's, live, as the episode's were: the harness is code, and what to do next is decided from what the
+game shows now, so bots that move differently or an enemy elsewhere don't throw it off. Through Aura it runs inside a
+run with Aura (`verify`), billed as runs are. `--recorded` replays the recorded picks instead (`regress.ReplayJev`, no
+model at all), for a game that plays the same every time. A replay passes when the episode ends done: the harness's
+own success condition, which is the claim. It says why when it doesn't (`ended running (stalled), not done`).
+Nothing else in the evidence is compared (rounds left, who holds an objective at the end, the name an object
+spawned in play gets, how long it took vary with play, and the claim is none of them), but what changed is listed
+with the result (`differs`): booleans and strings that differ, with Blueprint object names by class
+(`BP_Rifle_C_2147469854` is `BP_Rifle_C`: a packaged build numbers the objects it spawns differently from the
+editor), and numbers that moved beyond the regression's `tolerance` (0.25 relative). A regression's own `ignore`
+list leaves keys out of it. One that doesn't pass is played again (`--retries`,
+default 2: up to 3 tries) and passes on the first try that does: a claim that something can happen holds once play
+shows it, and a game with bots doesn't always give the chance. With `--recorded` every try plays the same, so a pass
+after a failed try is reported FLAKY, which usually means its harness reads the game too tightly. It imports the project's lib.py as it is now, so a change to lib.py that breaks an old verification shows
+(`--frozen-lib`: each regression's own snapshot). `--seconds` caps each episode (default as long as the recorded one was
+allowed, else 3x the recorded one; at least 20 s). A build starts in its default map, often a menu: `--level /Game/Maps/Arena` replays a regression saved before
 regressions kept their level in that level. The command exits 0 when every regression passes, 1 otherwise.
 
 ## Testing a build

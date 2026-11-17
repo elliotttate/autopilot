@@ -12,7 +12,8 @@
     python -m autopilot run memory/<project>/runs/<run>/harness.py [--seconds 60] [--no-restart]
         Play a saved harness again, with no language model (Jev decides), e.g. to watch it.
     python -m autopilot regress [--project PATH | --build GAME.exe] [--regressions FOLDER] [--watch] [--only ID]
-        Replay the CONFIRMED verifications kept as regressions (autopilot/regress.py) with no model at all, on the
+        Replay the CONFIRMED verifications kept as regressions (autopilot/regress.py): their harnesses, the decision
+        model deciding in play (no agent; --recorded: the recorded decisions, no model), up to 3 tries each, on the
         project's game headless, on a Development build of it (no editor, no project: QA machines, CI), or on the
         editor's (--no-launch). Exits 0 when every one passes.
     python -m autopilot qa
@@ -1075,11 +1076,38 @@ def wanted(args):
     return ids or None
 
 
-def regress_on(game, project, args, say=print):
-    """Replay the project's regressions (or --regressions') on game without a model (autopilot/regress.py): 0 when
-    every one passes. The project's: those in the game's own folder (exported) and its memory (regress.folders).
-    --only: those regressions alone. Their traces and the results (results.json) go to --out, by default a new folder
-    under the settings folder's regress/; --json: the results there too."""
+class NoDecisions(Exception):
+    """Why a replay with live decisions can't start (no decision model to ask), as words for the user."""
+
+
+@contextlib.contextmanager
+def replay_decisions(link, project, live):
+    """Jev's client for replays deciding live (regress.replay's client), inside a run with Aura when runs go through
+    Aura (billed as a run is: its relay carries the decision model's key); None with live False (recorded decisions,
+    no model). Raises NoDecisions when there is no decision model to ask."""
+    if not live:
+        yield None
+        return
+    if not aura.enabled() and not (os.environ.get("TYPESAFE_API_KEY") or "").strip():
+        raise NoDecisions(
+            "Replaying with live decisions needs Autopilot's decision model: sign in to Aura (`autopilot login`, then "
+            "replay with --aura) or add the line TYPESAFE_API_KEY=<the key> (https://typesafe.ai) to "
+            f"{account._user_env_path()}. Or replay with --recorded: the recorded decisions, no model.")
+    try:
+        run = start_aura_run(link, "verify", (getattr(link, "hello", None) or {}).get("project") or project) \
+            if aura.enabled() else None
+    except aura.Refused as e:
+        raise NoDecisions(e.message) from None
+    with run or contextlib.nullcontext():
+        yield runtime.jev_client()
+
+
+def regress_on(game, project, args, say=print, link=None):
+    """Replay the project's regressions (or --regressions') on game (autopilot/regress.py), their decisions made live
+    by the decision model (with no agent), or the recorded ones with --recorded (no model): 0 when every one passes.
+    The project's: those in the game's own folder (exported) and its memory (regress.folders). --only: those
+    regressions alone. Their traces and the results (results.json) go to --out, by default a new folder under the
+    settings folder's regress/; --json: the results there too."""
     from . import regress
 
     root = codexmod.project_dir(project)
@@ -1106,12 +1134,23 @@ def regress_on(game, project, args, say=print):
         say(f"No regressions at {where}")
         summary = regress.summary([])
     else:
-        say(f"Replaying {len(regs)} regression(s) from {where}, without a model")
-        results = regress.replay_all(game, regs, project_root=root, frozen_lib=getattr(args, "frozen_lib", False),
-                                     seconds=getattr(args, "seconds", None), say=say,
-                                     retries=getattr(args, "retries", regress.RETRIES), out_dir=out,
-                                     on_event=lambda e: regress_event(args, e.pop("event"), **e),
-                                     level=getattr(args, "level", None))
+        live = not getattr(args, "recorded", False)
+        retries = getattr(args, "retries", None)
+        try:
+            with replay_decisions(link or getattr(game, "link", None), project, live) as client:
+                say(f"Replaying {len(regs)} regression(s) from {where}, "
+                    + ("the decision model deciding in play (no agent)" if live else
+                       "with their recorded decisions (no model)"))
+                results = regress.replay_all(game, regs, project_root=root,
+                                             frozen_lib=getattr(args, "frozen_lib", False),
+                                             seconds=getattr(args, "seconds", None), say=say,
+                                             retries=regress.RETRIES if retries is None else retries, out_dir=out,
+                                             on_event=lambda e: regress_event(args, e.pop("event"), **e),
+                                             level=getattr(args, "level", None), client=client)
+        except NoDecisions as e:
+            say(str(e))
+            regress_event(args, "error", message=str(e))
+            return 1
         summary = regress.summary(results)
         say(f"{summary['passed']}/{summary['total']} passed"
             + (f" ({len(summary['flaky'])} flaky: passed only on a retry)" if summary["flaky"] else ""))
@@ -1131,7 +1170,7 @@ def cmd_regress(link, args):
     game = Game(link, codexmod.Codex.for_project(project))
     try:
         with run_holds(link):  # (the replays drive the game: another game's plugin can't take the link over)
-            return regress_on(game, project, args)
+            return regress_on(game, project, args, link=link)
     finally:
         if getattr(args, "game_process", None) is not None:
             processes.kill(args.game_process)
@@ -1469,8 +1508,8 @@ def parser():
     r.add_argument("--no-restart", action="store_true", help="go on from where the game is")
     r.add_argument("--aura", action="store_true",
                    help="sign in with Aura: run on your Aura plan instead of your own keys")
-    rg = sub.add_parser("regress", help="replay the regressions (harnesses of CONFIRMED claims) without a model: "
-                                        "starts the game headless (--project), a build of it (--build), or waits for "
+    rg = sub.add_parser("regress", help="replay the regressions (harnesses of CONFIRMED claims), the decision model "
+                                        "deciding in play (no agent): starts the game headless (--project), a build of it (--build), or waits for "
                                         "the editor (--no-launch)")
     rg.add_argument("--project", dest="path", help=project_help)
     rg.add_argument("--build", help="a built game to replay them on, with no editor and no project: an Unreal "
@@ -1490,22 +1529,29 @@ def parser():
     rg.add_argument("--events", action="store_true", help="also print each step as one line of JSON (for tools)")
     rg.add_argument("--connect-timeout", type=float, default=180.0,
                     help="seconds a game this starts has to connect (default 180)")
-    rg.add_argument("--seconds", type=float, help="each replay's longest episode (default: 1.5x the recorded one)")
+    rg.add_argument("--seconds", type=float, help="each replay's longest episode (default: as long as the recorded "
+                                                  "one was allowed, else 3x the recorded one)")
+    rg.add_argument("--recorded", action="store_true",
+                    help="replay the recorded decisions, with no model (for a game that plays the same each time); "
+                         "by default the decision model decides in play, as it did when the claim was confirmed")
+    rg.add_argument("--aura", action="store_true",
+                    help="sign in with Aura: the decision model runs on your Aura plan instead of your own key")
     rg.add_argument("--level", help="the level to replay a regression in when it doesn't name one (one saved before "
                                     "regressions kept their level): a path such as /Game/Maps/Arena; a build starts "
                                     "in its default map, often a menu")
     rg.add_argument("--frozen-lib", action="store_true",
                     help="use each regression's own lib.py snapshot, not the project's lib.py now")
     rg.add_argument("--json", help="write the results there")
-    rg.add_argument("--retries", type=int, default=1,
-                    help="replay a failed regression again this many times; one that then passes is reported flaky "
-                         "(default 1; 0: no retries)")
+    rg.add_argument("--retries", type=int,
+                    help="play a regression that didn't pass again up to this many times: it passes on the first try "
+                         "that does (default 2: up to 3 tries; 0: one try); with --recorded, one that passes only on a "
+                         "retry is reported flaky")
     rg.add_argument("--port", type=int, help="where to listen for the game (default 8765; with --build any free "
                                              "port)")
     rg.add_argument("--engine", help="the game's executable (default: the engine adapter's)")
     rg.add_argument("--no-launch", action="store_true", help="don't start the game: wait for the editor's plugin")
-    qa = sub.add_parser("qa", help="Autopilot QA: a window that replays a game's regressions on a build of it, "
-                                   "without a model (autopilot regress --build)")
+    qa = sub.add_parser("qa", help="Autopilot QA: a window that replays a game's regressions on a build of it "
+                                   "(autopilot regress --build) and runs tests on it (autopilot play --build)")
     qa.add_argument("--build", help="the build to start with (remembered from the last time otherwise)")
     qa.add_argument("--regressions", help="the regressions folder to start with (the game's Autopilot/regressions)")
     li = sub.add_parser("login", help="sign in to Aura on its website (for runs with Aura without the Aura app)")

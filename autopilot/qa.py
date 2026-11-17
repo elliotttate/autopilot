@@ -1,13 +1,16 @@
-"""Autopilot QA: a window that replays a game's regressions on a build of it, without a model (`autopilot qa`).
+"""Autopilot QA: a window that replays a game's regressions on a build of it (`autopilot qa`).
 
-For QA engineers: no editor, no project, no sign-in. A developer's Autopilot keeps every CONFIRMED verification as a
+For QA engineers: no editor, no project. A developer's Autopilot keeps every CONFIRMED verification as a
 regression (autopilot/regress.py), and `autopilot codex --project <source> --out <game>/Autopilot` exports them into
 the game's own folder (Autopilot/regressions), which goes into source control with the game. Here QA picks a build
 of the game (a Development build: Unreal packaged, Unity player, Godot export) and that folder, and presses Replay:
 the window runs `autopilot regress --build <exe> --regressions <folder> --events`, which starts the build (in a
-window to watch, or headless), replays the regressions with their recorded decisions and ends the build; the window
-lists each one's result as it comes (ok, FAIL with why, FLAKY: passed only on a second try), and keeps the results and
-the replays' traces in a folder of their own (Open results).
+window to watch, or headless), replays the regressions (their saved harnesses, the decision model deciding in play as
+it did when each claim was confirmed: Aura's, with the machine signed in to Aura, else the TypeSafe key in
+autopilot.env; or, ticked, the recorded decisions with no model) and ends the build; the window lists each one's
+result as it comes (ok, FAIL with why; up to 3 tries each, ticked; FLAKY: with recorded decisions, passed only on a
+retry) and what changed (not compared), and keeps the results and the replays' traces in a folder of their
+own (Open results).
 
 The command it runs is the one CI runs, so what QA sees here is what a pipeline gets. What the window remembers (the
 build, the folder, the options) is in qa.json in Autopilot's settings folder.
@@ -145,10 +148,12 @@ def test_command(build, folder, prompt, minutes=None, watch=True, python=None):
     return cmd
 
 
-def command(build, regressions=None, only=None, watch=True, retries=1, python=None):
+def command(build, regressions=None, only=None, watch=True, retries=2, recorded=False, python=None):
     """The `autopilot regress` the window runs."""
     cmd = [python or sys.executable, "-m", "autopilot", "regress", "--build", build, "--events",
            "--retries", str(max(0, int(retries)))]
+    if recorded:
+        cmd.append("--recorded")
     if regressions:
         cmd += ["--regressions", regressions]
     if watch:
@@ -217,7 +222,7 @@ class Model:
                     self.rows[item["id"]] = {**item, "status": WAITING, "why": "", "seconds": None, "trace": None,
                                              "evidence": None}
             self.pending = [i for i in self.order if i in known]
-            self.status = (f"Replaying {len(items)} regression{'s' if len(items) != 1 else ''}, without a model..."
+            self.status = (f"Replaying {len(items)} regression{'s' if len(items) != 1 else ''}..."
                            if items else "No regressions to replay in that folder.")
             return {"rows", "status"}
         if event == "replaying":
@@ -233,14 +238,14 @@ class Model:
             if row:
                 row.update(status=FLAKY if data.get("flaky") else PASSED if data.get("passed") else FAILED,
                            why=data.get("why") or "", seconds=data.get("seconds"), trace=data.get("trace"),
-                           evidence=data.get("evidence"))
+                           evidence=data.get("evidence"), differs=data.get("differs") or [])
             return {"rows"}
         if event == "summary":
             self.summary = data
             self.out = data.get("out") or self.out
             flaky = len(data.get("flaky") or [])
             self.status = (f"{data.get('passed', 0)}/{data.get('total', 0)} passed"
-                           + (f", {flaky} flaky (passed only on a second try)" if flaky else "") + ".")
+                           + (f", {flaky} flaky (passed only on a retry)" if flaky else "") + ".")
             return {"status"}
         if event == "error":
             self.error = data.get("message") or "the replay failed"
@@ -295,6 +300,8 @@ class Model:
             out += [("label", "\nREPLAY\n"), (TONE[row["status"]], f"{WORDS[row['status']]}\n")]
         if row.get("summary"):
             out += [("label", "\nWHEN IT WAS VERIFIED\n"), ("text", f"{row['summary']}\n")]
+        if done and row.get("differs"):
+            out += [("label", "\nWHAT CHANGED (NOT COMPARED)\n"), ("mono", "\n".join(row["differs"]) + "\n")]
         if done and row.get("evidence") is not None:
             out += [("label", "\nWHAT THE REPLAY ENDED ON\n"), ("mono", json.dumps(row["evidence"], indent=1) + "\n")]
         if done and row.get("trace"):
@@ -514,6 +521,7 @@ class Window:
         self.folder = tk.StringVar(value=regressions or saved.get("folder") or saved.get("regressions") or "")
         self.watch = tk.BooleanVar(value=saved.get("watch", True))
         self.retry = tk.BooleanVar(value=saved.get("retry", True))
+        self.recorded = tk.BooleanVar(value=saved.get("recorded", False))
         self.minutes = tk.StringVar(value=str(saved.get("minutes") or 20))
         self.build_note = tk.StringVar()
         self.folder_note = tk.StringVar()
@@ -539,7 +547,9 @@ class Window:
         opts.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
         ttk.Checkbutton(opts, text="Watch the game (show its window)", variable=self.watch,
                         style="Plate.Autopilot.TCheckbutton").pack(side="left")
-        ttk.Checkbutton(opts, text="Replay a failed one once more (flaky check)", variable=self.retry,
+        ttk.Checkbutton(opts, text="Up to 3 tries each", variable=self.retry,
+                        style="Plate.Autopilot.TCheckbutton").pack(side="left", padx=(20, 0))
+        ttk.Checkbutton(opts, text="Recorded decisions (no model)", variable=self.recorded,
                         style="Plate.Autopilot.TCheckbutton").pack(side="left", padx=(20, 0))
 
         # (the status line first, at the bottom: packed after the pages, a small window would squeeze it out)
@@ -779,6 +789,7 @@ class Window:
     def remember(self):
         save_settings({"build": self.build.get().strip(), "folder": self.folder.get().strip(),
                        "watch": bool(self.watch.get()), "retry": bool(self.retry.get()),
+                       "recorded": bool(self.recorded.get()),
                        "minutes": self.minutes.get().strip(), "prompt": self.prompt_text()})
 
     def prompt_text(self):
@@ -813,7 +824,8 @@ class Window:
         if not getattr(self, "build_ok", False) or self.busy():
             return
         cmd = command(self.build.get().strip(), regressions_folder(self.folder.get()), only=only,
-                      watch=self.watch.get(), retries=1 if self.retry.get() else 0)
+                      watch=self.watch.get(), retries=2 if self.retry.get() else 0,
+                      recorded=self.recorded.get())
         self.model.start(only or list(self.model.order))
         self.render_rows()
         self.launch(cmd, "REPLAY", self.log)

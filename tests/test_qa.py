@@ -40,11 +40,14 @@ def test_the_command_is_autopilot_regress_on_the_build():
                    "--regressions", "C:/g/Autopilot/regressions", "--watch", "--only", "r1,r2"]
     cmd = qa.command("Game.exe", None, watch=False, retries=0, python="py")
     assert cmd == ["py", "-m", "autopilot", "regress", "--build", "Game.exe", "--events", "--retries", "0"]
+    cmd = qa.command("Game.exe", None, watch=False, recorded=True, python="py")
+    assert cmd == ["py", "-m", "autopilot", "regress", "--build", "Game.exe", "--events", "--retries", "2",
+                   "--recorded"]
     from autopilot import cli
 
     args = cli.parser().parse_args(qa.command("Game.exe", "regs", only=["a"], python="py")[3:])
     assert args.build == "Game.exe" and args.regressions == "regs" and args.only == ["a"] and args.watch
-    assert args.events and args.retries == 1
+    assert args.events and args.retries == 2 and not args.recorded  # (up to 3 tries, the decision model deciding)
 
 
 def test_what_the_choices_say(tmp_path):
@@ -96,7 +99,7 @@ def events_of_a_replay():
             {"id": "r1", "prompt": "Verify the coin counts", "dir": "regs/r1"},
             {"id": "r2", "prompt": "Verify the door opens", "dir": "regs/r2"}]}),
         ("event", {"event": "replaying", "id": "r1", "try": 1}),
-        ("event", {"event": "result", "id": "r1", "passed": True, "why": "as recorded", "seconds": 12.2,
+        ("event", {"event": "result", "id": "r1", "passed": True, "why": "ended done", "seconds": 12.2,
                    "trace": "OUT/r1.jsonl", "evidence": {"coins": 1}}),
         ("event", {"event": "replaying", "id": "r2", "try": 1}),
         ("event", {"event": "replaying", "id": "r2", "try": 2, "why": "evidence differs"}),
@@ -179,13 +182,13 @@ def test_the_model_follows_a_replay():
         if kind == "event" and data.get("id") == "r2" and data.get("try") == 2:
             assert m.status == "Replaying 2 of 2 (try 2)..." and m.rows["r2"]["status"] == qa.REPLAYING
     assert "Starting the build (in a window)..." in seen and "Connected to MyGame." in seen
-    assert "Replaying 2 regressions, without a model..." in seen and "Replaying 1 of 2..." in seen
+    assert "Replaying 2 regressions..." in seen and "Replaying 1 of 2..." in seen
     assert [m.rows[r]["status"] for r in ("r1", "r2")] == [qa.PASSED, qa.FLAKY]
-    assert m.status == "2/2 passed, 1 flaky (passed only on a second try)." and not m.running and m.out == "OUT"
+    assert m.status == "2/2 passed, 1 flaky (passed only on a retry)." and not m.running and m.out == "OUT"
     assert m.tone() == "good" and m.tag() == ("success", "PASSED 2/2")
     assert m.log == ["Starting Unreal Engine build Game.exe (in a window; its log: x.log)"]
     text = m.details("r1")
-    assert text.startswith("Verify the coin counts") and "REPLAY\nOK  as recorded (12s)" in text
+    assert text.startswith("Verify the coin counts") and "REPLAY\nOK  ended done (12s)" in text
     assert '"coins": 1' in text and "TRACE\nOUT/r1.jsonl" in text and "id r1" in text
     parts = m.detail_parts("r2")
     assert parts[0] == ("title", "Verify the door opens\n") and ("amber", "FLAKY") in parts
@@ -290,13 +293,13 @@ def test_the_window(tmp_path, monkeypatch):
         assert list(w.tree.get_children()) == ["r1", "r2"]
         assert "!disabled" not in w.stop_button.state() and "disabled" not in w.all_button.state()
         w.replay_all()
-        assert started[0][3:] == ["regress", "--build", build, "--events", "--retries", "1", "--regressions", regs]
+        assert started[0][3:] == ["regress", "--build", build, "--events", "--retries", "2", "--regressions", regs]
         assert "disabled" in w.all_button.state()
         w.replay.done = True
         w.poll()
         assert [w.tree.set(r, "status") for r in ("r1", "r2")] == ["OK", "FLAKY"]
         assert w.tag_label.cget("text") == "PASSED 2/2" and w.tag_label.winfo_manager() == "pack"
-        assert w.status.get() == "2/2 passed, 1 flaky (passed only on a second try)."
+        assert w.status.get() == "2/2 passed, 1 flaky (passed only on a retry)."
         w.tree.selection_set(["r2"])
         w.show_details()
         assert "passed on try 2" in w.details.get("1.0", "end")

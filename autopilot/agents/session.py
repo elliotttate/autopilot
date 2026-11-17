@@ -2259,7 +2259,7 @@ def finish(session, started, stopped, last_text, **facts):
         report["reading_usage"] = session.reader.model.tokens
     with open(os.path.join(session.run_dir, "report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1)
-    # A CONFIRMED claim's harness is kept as a regression that plays again without a model (autopilot/regress.py)
+    # A CONFIRMED claim's harness is kept as a regression that plays again with no agent (autopilot/regress.py)
     if str(report.get("outcome") or "").strip().upper() == "CONFIRMED":
         from .. import regress
 

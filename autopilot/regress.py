@@ -1,4 +1,4 @@
-"""Regression replay: every CONFIRMED verification is kept as a harness that plays again without a language model.
+"""Regression replay: every CONFIRMED verification is kept as a harness that plays again, with no agent.
 
 When a run reports a claim CONFIRMED (agents/session.finish), the harness of the episode that showed it is saved under
 the project's regressions folder with what that episode ended on:
@@ -15,15 +15,24 @@ the project's regressions folder with what that episode ended on:
 Autopilot memory replays them on a build of the game (`autopilot regress --build <Game.exe> --regressions <that
 folder>`, or the window `autopilot qa`). A replay of the project lists the game's folder's and the memory's.
 
-A replay (`autopilot regress`, or replay() here) restarts the level and runs the saved harness through the runtime as
-an episode did, but its decisions come from ReplayJev: the recorded picks, in order, where they are offered, else the
-option the recording picked most. No language model and no Jev: the same harness, the same game, deterministic
-choices. It passes when the episode ends in the state it ended in (done) with the same evidence: booleans, strings and
-None equal, numbers within `tolerance` (relative, regression.json; default 0.25). When and where in the episode
-something happened isn't compared (a key `t` or ending in `_t`, a time; ending in `_at`, a position such as
-`player_at`): a replay's picks land a little earlier or later than the recording's, so it ends a little elsewhere, and
-neither is what was verified. A duration is compared. A replay that fails says why; one that fails is played again
-(retries), and one that passes then is flaky.
+A replay (`autopilot regress`, or replay() here) restarts the level the regression was played on and runs the saved
+harness through the runtime as an episode did. Its decisions are Jev's, live, as the episode's were (`client`: the
+harness is code, and what to do next is decided from what the game shows now: bots that move differently, a dodge,
+an enemy elsewhere), with no agent; or, with no client (`autopilot regress --recorded`), ReplayJev's: the recorded
+picks, in order, where they are offered, else the option the recording picked most: no model at all, for a game
+that plays the same each time.
+
+It passes when the episode ends done: the harness's own success condition, which is the claim (the gate opened when the
+lever was pulled; five kills without a reload). Nothing else in its evidence is compared: rounds left, who holds
+an objective at the end, the name an object spawned in play gets, how long it took all vary with every play of a
+game with anything random in it, and the claim is none of them. What changed is listed with the result
+(`differs`: booleans and strings that differ, with Blueprint object names by class, by_class; numbers that moved by
+more than `tolerance`, relative, regression.json, default 0.25), so a change shows without failing the replay. A
+regression's own `ignore` list leaves keys out of it. One that doesn't pass is played again (`retries`, default
+2: up to 3 tries) and passes on the first try that does: a claim that something can happen holds when play shows it
+once, and a game with bots doesn't always give the chance. With recorded decisions every try plays the same, so a
+pass after a failed try is reported flaky (its harness reads the game too tightly). A replay's episode may last as
+long as the recorded one was allowed to (regression.json's `max_seconds`), else 3x the recorded one.
 
 Only an episode that started from a restarted level is saved (one that went on from where an earlier episode left
 play needs that state, which a replay can't rebuild): the latest such episode that ended done, else none.
@@ -42,9 +51,10 @@ from . import runtime
 
 FILE = "regression.json"
 TOLERANCE = 0.25
-RETRIES = 1  # times a failed replay is played again before it counts as failed (a pass then: flaky)
+RETRIES = 2  # times a replay that didn't pass is played again (the first try that passes passes)
 LOOKAHEAD = 5  # recorded picks a replay may skip to find one offered now (timings differ between runs)
-MIN_SECONDS = 20.0  # a replay's episode lasts at least this, and 1.5x the recorded one
+MIN_SECONDS = 20.0  # a replay's episode lasts at least this
+LONGER = 3.0  # without the recorded episode's own limit, a replay's lasts up to this many times the recorded one
 
 
 IN_GAME = ("Autopilot", "regressions")  # a game's regressions folder, inside its own project folder
@@ -127,11 +137,14 @@ def read_trace(path):
 
 def episode_of(events):
     """What a replay needs of one episode's trace: {"continued", "end": {state, note, evidence}, "picks", "extras",
-    "t"} (picks: the options Jev's answers chose, in order; extras: its other answers, by decision)."""
-    picks, extras, end, start_t, continued = [], [], None, None, False
+    "t", "max_seconds"} (picks: the options Jev's answers chose, in order; extras: its other answers, by decision;
+    max_seconds: how long the episode was allowed to play)."""
+    picks, extras, end, start_t, continued, limit = [], [], None, None, False, None
     for e in events:
         kind = e.get("kind") or e.get("event")
-        if kind == "continued":
+        if kind == "start" and isinstance(e.get("max_seconds"), (int, float)):
+            limit = e["max_seconds"]
+        elif kind == "continued":
             continued = True
         elif kind == "decision" and e.get("chosen"):
             picks.append(e["chosen"])
@@ -144,7 +157,7 @@ def episode_of(events):
     t = ((end or {}).get("progress") or {}).get("t")
     return {"continued": continued, "ended": end is not None, "reason": (end or {}).get("reason"),
             "end": {"state": status.get("state"), "note": status.get("note"), "evidence": status.get("evidence") or {}},
-            "picks": picks, "extras": extras, "t": t}
+            "picks": picks, "extras": extras, "t": t, "max_seconds": limit}
 
 
 def confirming_episode(run_dir):
@@ -210,6 +223,8 @@ def save(run_dir, report, project, project_root=None, dest=None, level=None):
     }
     if level:
         spec["map"] = level
+    if ep.get("max_seconds"):
+        spec["max_seconds"] = ep["max_seconds"]
     with open(os.path.join(dest, FILE), "w", encoding="utf-8") as f:
         json.dump(runtime.jsonable(spec), f, indent=1)
     return dest
@@ -328,36 +343,44 @@ def incidental(key):
     return isinstance(key, str) and (key == "t" or key.endswith(("_t", "_at")))
 
 
-def same(expected, got, tolerance=TOLERANCE, ignore=()):
-    """Why got differs from expected (a regression's evidence), or None: booleans, strings and None equal; numbers
-    within tolerance (relative, at least of 1); lists and dicts element by element, a dict's incidental keys skipped,
-    and the keys in ignore (a regression's own "ignore")."""
-    if isinstance(expected, bool) or expected is None or isinstance(expected, str):
-        return None if got == expected else f"{expected!r} then, {got!r} now"
-    if isinstance(expected, (int, float)):
-        if isinstance(got, bool) or not isinstance(got, (int, float)):
-            return f"{expected!r} then, {got!r} now"
-        return None if abs(got - expected) <= tolerance * max(1.0, abs(expected)) else f"{expected!r} then, {got!r} now"
-    if isinstance(expected, dict):
-        if not isinstance(got, dict):
-            return f"{expected!r} then, {got!r} now"
+INSTANCE = re.compile(r"\b(\w+?_C)_\d+\b")  # a Blueprint object's name: its class, then an instance number
+
+
+def by_class(text):
+    """Text with Blueprint object names as their classes (BP_Rifle_C_2147469854 -> BP_Rifle_C): an object the
+    game creates as it runs is numbered as it is created, in the editor from a small counter and in a packaged build
+    from another, so the same rifle has another name in every play; one placed in the level keeps its name
+    (BP_Gate_A). Only Blueprint instances (`..._C_<n>`): Lvl_2 stays Lvl_2."""
+    return INSTANCE.sub(r"\1", text) if isinstance(text, str) else text
+
+
+def differences(expected, got, tolerance=TOLERANCE, ignore=(), at=""):
+    """What changed in a replay's evidence from the recording's, as "key: then, now" lines: shown with the result,
+    never a failure (the harness's done is the claim; the rest varies with play: rounds left, who holds an objective
+    at the end). Booleans, strings (object names by class: by_class) and None when they differ; numbers when they moved by
+    more than tolerance (relative, at least of 1); lists when their length changed; keys there then and missing now.
+    When and where (incidental keys) and the keys in ignore (a regression's own "ignore") are left out."""
+    out = []
+    where = at or "value"
+    if isinstance(expected, dict) and isinstance(got, dict):
         for k, v in expected.items():
             if incidental(k) or k in ignore:
                 continue
+            key = f"{at}.{k}" if at else str(k)
             if k not in got:
-                return f"{k}: missing now"
-            why = same(v, got[k], tolerance, ignore)
-            if why:
-                return f"{k}: {why}"
-        return None
-    if isinstance(expected, list):
-        if not isinstance(got, list) or len(got) != len(expected):
-            return f"{expected!r} then, {got!r} now"
-        for i, (a, b) in enumerate(zip(expected, got)):
-            why = same(a, b, tolerance, ignore)
-            if why:
-                return f"[{i}]: {why}"
-    return None
+                out.append(f"{key}: missing now")
+            else:
+                out += differences(v, got[k], tolerance, ignore, key)
+    elif isinstance(expected, list) and isinstance(got, list):
+        if len(expected) != len(got):
+            out.append(f"{at or 'list'}: {len(expected)} then, {len(got)} now")
+    elif (isinstance(expected, (int, float)) and not isinstance(expected, bool)
+          and isinstance(got, (int, float)) and not isinstance(got, bool)):
+        if abs(got - expected) > tolerance * max(1.0, abs(expected)):
+            out.append(f"{where}: {expected!r} then, {got!r} now")
+    elif by_class(expected) != by_class(got) or type(expected) is not type(got):
+        out.append(f"{where}: {by_class(expected)!r} then, {by_class(got)!r} now")
+    return out
 
 
 def _load_harness(reg, lib_dir):
@@ -380,15 +403,28 @@ def start_level(harness, spec, level=None):
     return getattr(harness, "start_map", None) or spec.get("map") or level or None
 
 
-def replay(game, reg, project_root=None, frozen_lib=False, seconds=None, restart=True, trace=None, level=None):
-    """Play regression reg (its folder) again on game, without a model: {"id", "passed", "why", "state", "evidence",
-    "decisions", "seconds", "trace"}. lib: the project's live lib.py (project_root) unless frozen_lib, or there is
-    none: then the snapshot saved with it. trace: where the replay's trace goes (default: replay.jsonl in reg).
-    level: the level to replay in when neither the harness nor the regression names one (start_level)."""
+def episode_limit(spec, seconds=None):
+    """How long a replay's episode may play: `seconds` (--seconds), else as long as the recorded episode was allowed
+    (max_seconds), else LONGER times the recorded one; at least MIN_SECONDS."""
+    if seconds:
+        return float(seconds)
+    if isinstance(spec.get("max_seconds"), (int, float)) and spec["max_seconds"] > 0:
+        return max(MIN_SECONDS, float(spec["max_seconds"]))
+    return max(MIN_SECONDS, LONGER * float(spec.get("played_seconds") or 0))
+
+
+def replay(game, reg, project_root=None, frozen_lib=False, seconds=None, restart=True, trace=None, level=None,
+           client=None):
+    """Play regression reg (its folder) again on game: {"id", "passed", "why", "state", "evidence", "differs",
+    "decisions", "seconds", "trace", "decided"}. client: Jev's client, deciding live (runtime.jev_client()); None:
+    the recorded decisions (ReplayJev, no model). lib: the project's live lib.py (project_root) unless frozen_lib, or
+    there is none: then the snapshot saved with it. trace: where the replay's trace goes (default: replay.jsonl in
+    reg). level: the level to replay in when neither the harness nor the regression names one (start_level)."""
     spec = load(reg)
     started = time.time()
     out = {"id": spec.get("id") or os.path.basename(reg), "prompt": spec.get("prompt"), "passed": False, "why": "",
-           "state": None, "evidence": None, "decisions": 0, "seconds": 0.0, "dir": reg}
+           "state": None, "evidence": None, "differs": [], "decisions": 0, "seconds": 0.0, "dir": reg,
+           "decided": "live" if client is not None else "recorded"}
     lib_dir = reg
     if not frozen_lib and project_root and os.path.exists(os.path.join(project_root, "lib.py")):
         lib_dir = project_root
@@ -399,16 +435,15 @@ def replay(game, reg, project_root=None, frozen_lib=False, seconds=None, restart
         out["seconds"] = round(time.time() - started, 2)
         return out
     expect = spec.get("expect") or {}
-    played = spec.get("played_seconds") or 0
-    limit = seconds or max(MIN_SECONDS, 1.5 * float(played))
+    limit = episode_limit(spec, seconds)
     trace = trace or os.path.join(reg, "replay.jsonl")
     os.makedirs(os.path.dirname(os.path.abspath(trace)), exist_ok=True)
     try:
         if restart:
             game.restart(map=start_level(harness, spec, level))
         game.pause(False)
-        rt = runtime.Runtime(game, harness, trace, client=ReplayJev(spec.get("picks"), spec.get("extras")),
-                             max_seconds=limit)
+        decider = client if client is not None else ReplayJev(spec.get("picks"), spec.get("extras"))
+        rt = runtime.Runtime(game, harness, trace, client=decider, max_seconds=limit)
         result = rt.run()
     except Exception as e:
         out["why"] = f"the replay failed: {type(e).__name__}: {e}"
@@ -422,50 +457,64 @@ def replay(game, reg, project_root=None, frozen_lib=False, seconds=None, restart
     status = result.get("status") or {}
     out.update(state=status.get("state"), evidence=status.get("evidence"), decisions=result.get("decisions") or 0,
                seconds=round(time.time() - started, 2), trace=trace)
+    tolerance, ignore = float(spec.get("tolerance", TOLERANCE)), set(spec.get("ignore") or ())
+    out["differs"] = differences(expect.get("evidence") or {}, status.get("evidence") or {}, tolerance, ignore)
     if status.get("state") != expect.get("state"):
         out["why"] = (f"ended {status.get('state') or 'without a status'} ({result.get('reason') or ''}"
                       f"{': ' + status['note'] if status.get('note') else ''}), not {expect.get('state')}")
         return out
-    why = same(expect.get("evidence") or {}, status.get("evidence") or {}, float(spec.get("tolerance", TOLERANCE)),
-               set(spec.get("ignore") or ()))
-    if why:
-        out["why"] = f"evidence differs: {why}"
-        return out
     out["passed"] = True
-    out["why"] = "as recorded"
+    out["why"] = f"ended {status.get('state')}" + (f": {status['note']}" if status.get("note") else "")
     return out
 
 
+def try_trace(trace, n):
+    """Where try n of a replay's trace goes: trace itself for the first, <name>-try<n>.jsonl for the others."""
+    if not trace or n <= 1:
+        return trace
+    stem, ext = os.path.splitext(trace)
+    return f"{stem}-try{n}{ext}"
+
+
 def replay_all(game, regs, project_root=None, frozen_lib=False, seconds=None, say=print, retries=RETRIES,
-               out_dir=None, on_event=None, level=None):
-    """replay() of each regression folder in regs, one after another (one game): their results. One that fails is
-    replayed again, up to `retries` times (a replay costs no model): one that then passes is FLAKY (its "flaky": it
-    passed, but not every time: its harness reads the game too tightly, or the game itself varies). out_dir: where
-    the replays' traces go (<id>.jsonl; default: in each regression's folder). on_event: told
-    {"event": "replaying", "id", "try"} as each replay starts and {"event": "result", **result} as each ends. level:
-    the level to replay those that don't name one in (start_level)."""
+               out_dir=None, on_event=None, level=None, client=None):
+    """replay() of each regression folder in regs, one after another (one game): their results. One that doesn't
+    pass is played again, up to `retries` times, and passes on the first try that does (its "tries": how many it
+    took; "earlier": why the tries before didn't). With live decisions (client) that is play varying: bots elsewhere,
+    no chance this time. With recorded ones (no client) every try plays the same, so a pass after a failed try is
+    FLAKY (its "flaky": its harness reads the game too tightly, or the game itself varies). out_dir: where the
+    replays' traces go (<id>.jsonl, <id>-try<n>.jsonl; default: in each regression's folder). on_event: told
+    {"event": "replaying", "id", "try"} as each try starts and {"event": "result", **result} as each regression ends.
+    level: the level to replay those that don't name one in (start_level)."""
     results = []
     tell = on_event or (lambda event: None)
     for reg in regs:
         rid = describe(reg)["id"]
-        trace = os.path.join(out_dir, f"{rid}.jsonl") if out_dir else None
-        tell({"event": "replaying", "id": rid, "try": 1})
-        r = replay(game, reg, project_root=project_root, frozen_lib=frozen_lib, seconds=seconds, trace=trace,
-                   level=level)
-        first = r
-        for k in range(max(0, retries)):
+        trace = os.path.join(out_dir, f"{rid}.jsonl") if out_dir else os.path.join(reg, "replay.jsonl")
+        earlier = []
+        for n in range(1, max(0, retries) + 2):
+            tell({"event": "replaying", "id": rid, "try": n, **({"why": earlier[-1]} if earlier else {})})
+            r = replay(game, reg, project_root=project_root, frozen_lib=frozen_lib, seconds=seconds,
+                       trace=try_trace(trace, n), level=level, client=client)
             if r["passed"]:
                 break
-            tell({"event": "replaying", "id": rid, "try": k + 2, "why": r["why"]})
-            r = replay(game, reg, project_root=project_root, frozen_lib=frozen_lib, seconds=seconds, trace=trace,
-                   level=level)
-            if r["passed"]:
-                r = dict(r, flaky=True, why=f"passed on try {k + 2}; the first: {first['why']}")
+            earlier.append(r["why"])
+        r = dict(r, tries=n, earlier=earlier[:n - 1] if r["passed"] else earlier[:-1])
+        if r["passed"] and earlier:
+            r["why"] = f"passed on try {n}; before: {'; '.join(earlier)}"
+            if client is None:
+                r["flaky"] = True
+        elif not r["passed"] and n > 1:
+            r["why"] = f"{r['why']} (on each of {n} tries)" if len(set(earlier)) == 1 else \
+                f"not passed in {n} tries: {'; '.join(earlier)}"
         results.append(r)
         tell({"event": "result", **r})
         if say:
             mark = "FLAKY" if r.get("flaky") else "ok   " if r["passed"] else "FAIL "
-            say(f"  {mark} {r['id']}: {r['prompt'] or ''}  ({r['why']}, {r['seconds']:.0f}s)")
+            said = f"  {mark} {r['id']}: {r['prompt'] or ''}  ({r['why']}, {r['seconds']:.0f}s)"
+            if r.get("differs"):
+                said += "\n         what changed (not compared): " + "; ".join(r["differs"])
+            say(said)
     return results
 
 

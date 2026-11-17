@@ -2,7 +2,7 @@
 of it (a QA machine, CI) plays it as well as the developer's.
 
     <game>/Autopilot/
-        regressions/     CONFIRMED verifications that replay without a model (autopilot/regress.py), saved in the
+        regressions/     CONFIRMED verifications that replay with no agent (autopilot/regress.py), saved in the
                          memory when they're verified and copied here by an export
         codex/           the code index: the game's code, its Blueprints, scenes or data as text, which a run reads.
                          A build carries no source, so it is made from the source (the editor's runs, or

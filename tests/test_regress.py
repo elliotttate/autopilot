@@ -1,5 +1,5 @@
 """Regression replay (autopilot/regress.py) on tests/simharness.py's tiny game: a CONFIRMED verification's
-harness is kept under regressions/ and plays again without a model; a change to lib.py that breaks it shows."""
+harness is kept under regressions/ and plays again with no agent; a change to lib.py that breaks it shows."""
 
 import json
 import os
@@ -48,7 +48,7 @@ def test_a_confirmed_claim_is_kept_and_replays_without_a_model(tmp_path, memory)
     finally:
         world.close()
     assert r["passed"], r
-    assert r["why"] == "as recorded" and r["evidence"]["near_coin"] is True and r["decisions"] >= 1
+    assert r["why"].startswith("ended done") and r["evidence"]["near_coin"] is True and r["decisions"] >= 1
     assert os.path.exists(os.path.join(reg, "replay.jsonl"))
     # (no language model, no Jev: the replay's decisions are the recording's)
     assert all(c[0] != "jev" for c in world.calls)
@@ -119,6 +119,77 @@ def test_session_finish_saves_the_regression(tmp_path, memory, monkeypatch):
     assert seen == ["CONFIRMED"]
 
 
+def test_regress_decides_live_with_the_decision_model_by_default(tmp_path, memory, monkeypatch, capsys):
+    """By default a replay's decisions are Jev's, live, as the episode's were (the harness is code; what to do next
+    comes from what the game shows now), with no agent: on the user's own TypeSafe key, or inside a run with Aura.
+    With neither it says how to get one (or --recorded) and replays nothing."""
+    run_dir, report = confirmed(tmp_path, memory)
+    regress.save(run_dir, report, "Tiny", project_root=memory)
+    monkeypatch.setattr(cli.codexmod, "project_dir", lambda project: memory)
+    monkeypatch.setattr(cli.aura, "enabled", lambda: False)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    args = cli.parser().parse_args(["regress", "--events", "--out", str(tmp_path / "out")])
+    assert cli.regress_on(None, "Tiny", args) == 1
+    said = capsys.readouterr().out
+    assert "needs Autopilot's decision model" in said and "--recorded" in said
+    assert any(json.loads(line).get("event") == "error" for line in said.splitlines() if line.startswith("{"))
+
+    # with a key: Jev's client decides (a stand-in here, deciding as the recording did)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    spec = regress.load(os.path.join(memory, "regressions", "run-1"))
+    clients = []
+    monkeypatch.setattr(cli.runtime, "jev_client", lambda: clients.append(regress.ReplayJev(spec["picks"])) or
+                        clients[-1])
+    game, world, _ = sim.connect()
+    try:
+        assert cli.regress_on(game, "Tiny", args) == 0
+    finally:
+        world.close()
+    out = capsys.readouterr().out
+    assert len(clients) == 1 and clients[0].calls >= 1 and "the decision model deciding in play" in out
+    result = [json.loads(line) for line in out.splitlines() if line.startswith('{"event": "result"')][0]
+    assert result["decided"] == "live" and result["passed"] and result["tries"] == 1
+
+    # through Aura: the client is made inside the run (its relay carries the key), and a refusal is told
+    monkeypatch.delenv("TYPESAFE_API_KEY")
+    monkeypatch.setattr(cli.aura, "enabled", lambda: True)
+    inside = []
+
+    class Run:
+        def __enter__(self):
+            inside.append("in")
+
+        def __exit__(self, *exc):
+            inside.append("out")
+
+    monkeypatch.setattr(cli, "start_aura_run", lambda link, kind, project, **kw: inside.append(kind) or Run())
+    with cli.replay_decisions(None, "Tiny", True) as client:
+        assert client is clients[-1] and inside == ["verify", "in"]
+    assert inside[-1] == "out"
+
+    def refused(*a, **kw):
+        raise cli.aura.Refused(401, "Sign in to Aura first: run `autopilot login`, then start the run again.")
+
+    monkeypatch.setattr(cli, "start_aura_run", refused)
+    with pytest.raises(cli.NoDecisions, match="autopilot login"):
+        with cli.replay_decisions(None, "Tiny", True):
+            pass
+    with cli.replay_decisions(None, "Tiny", False) as client:
+        assert client is None  # (--recorded: no model)
+
+
+def test_a_replay_may_play_as_long_as_the_recorded_episode_was_allowed(tmp_path, memory):
+    """A replay's episode lasts up to what the recorded one was allowed (kept as max_seconds), else 3x the recorded
+    one: a lucky recording that was quick doesn't make a replay's limit tight."""
+    run_dir, report = confirmed(tmp_path, memory)
+    spec = regress.load(regress.save(run_dir, report, "Tiny", project_root=memory))
+    assert spec["max_seconds"] == 3.0  # (sim.play's)
+    assert regress.episode_limit({"max_seconds": 150, "played_seconds": 37}) == 150
+    assert regress.episode_limit({"played_seconds": 37}) == 111  # (saved before max_seconds was kept)
+    assert regress.episode_limit({"played_seconds": 2}) == regress.MIN_SECONDS
+    assert regress.episode_limit({"max_seconds": 150}, seconds=40) == 40
+
+
 def test_a_regression_keeps_its_level_and_a_replay_opens_it(tmp_path, memory):
     """A build starts in its default map (often a menu), not the level the editor had open: a regression keeps the
     level its episode played and a replay opens it; one saved before that is replayed in --level."""
@@ -156,14 +227,34 @@ def test_a_regression_keeps_its_level_and_a_replay_opens_it(tmp_path, memory):
     assert cli.parser().parse_args(["regress", "--level", "/Game/Maps/Arena"]).level == "/Game/Maps/Arena"
 
 
-def test_evidence_comparison():
-    assert regress.same({"a": True, "n": 10, "s": "x"}, {"a": True, "n": 11, "s": "x", "extra": 1}) is None
-    assert "a:" in regress.same({"a": True}, {"a": False})
-    assert "n:" in regress.same({"n": 1}, {"n": 2})
-    assert regress.same({"n": 0}, {"n": 0.2}) is None  # (within the tolerance of 1)
-    assert "missing" in regress.same({"k": 1}, {})
-    assert regress.same({"l": [1, "a"]}, {"l": [1, "a"]}) is None and regress.same({"l": [1]}, {"l": [1, 2]})
-    assert regress.same(3, True) is not None
+def test_what_changed_is_listed_never_compared():
+    """A replay passes on the harness's done (the claim); what else its evidence shows is listed when it changed
+    (booleans, strings, None; numbers beyond the tolerance, relative, at least of 1; lists whose length changed; keys
+    gone), never a failure."""
+    d = regress.differences
+    assert d({"a": True, "n": 10, "s": "x", "m": 0}, {"a": True, "n": 11, "s": "x", "m": 0.2, "extra": 1}) == []
+    assert d({"a": True}, {"a": False}) == ["a: True then, False now"]
+    assert d({"s": "Held by A"}, {"s": "Neutral"}) == ["s: 'Held by A' then, 'Neutral' now"]
+    assert d({"a": True}, {"a": 1}) == ["a: True then, 1 now"]  # (a boolean is a boolean)
+    assert d({"k": None}, {"k": 3}) == ["k: None then, 3 now"] and d({"k": True}, {}) == ["k: missing now"]
+    assert d({"ammo": 8, "r": {"used": 22, "ok": True}, "log": [1, 2]},
+             {"ammo": 20, "r": {"used": 10, "ok": True}, "log": [1]}) == [
+        "ammo: 8 then, 20 now", "r.used: 22 then, 10 now", "log: 2 then, 1 now"]
+
+
+def test_objects_spawned_in_play_are_told_by_their_class():
+    """An object the game spawns as it runs is numbered as it is created, from another counter in a packaged build
+    than in the editor (BP_Rifle_C_2 then, BP_Rifle_C_2147469854 now): the same rifle. What changed shows Blueprint
+    object names by class; other names that end in a number (a level, a placed object) stay as they are."""
+    assert regress.by_class("BP_Rifle_C_2147469854") == "BP_Rifle_C"
+    assert regress.by_class("/Game/Maps/Arena.Arena:PersistentLevel.BP_Rifle_C_2") == \
+        "/Game/Maps/Arena.Arena:PersistentLevel.BP_Rifle_C"
+    assert regress.by_class("Lvl_2") == "Lvl_2" and regress.by_class("BP_Gate_A") == "BP_Gate_A"
+    assert regress.by_class(3) == 3
+    assert regress.differences({"weapon": "BP_Rifle_C_2"}, {"weapon": "BP_Rifle_C_2147469854"}) == []
+    assert regress.differences({"weapon": "BP_Rifle_C_2"}, {"weapon": "BP_Pistol_C_7"}) == [
+        "weapon: 'BP_Rifle_C' then, 'BP_Pistol_C' now"]
+    assert regress.differences({"level": "Lvl_2"}, {"level": "Lvl_3"}) == ["level: 'Lvl_2' then, 'Lvl_3' now"]
 
 
 def test_replay_jev_follows_the_recording():
@@ -186,7 +277,7 @@ def test_cli_regress_replays_the_project_regressions(tmp_path, memory, monkeypat
     run_dir, report = confirmed(tmp_path, memory)
     reg = regress.save(run_dir, report, "Tiny", project_root=memory)
     monkeypatch.setattr(cli.codexmod, "project_dir", lambda project: memory)
-    args = cli.parser().parse_args(["regress", "--json", str(tmp_path / "out.json")])
+    args = cli.parser().parse_args(["regress", "--recorded", "--json", str(tmp_path / "out.json")])
     assert args.cmd == "regress" and not args.no_launch
     game, world, _ = sim.connect()
     try:
@@ -196,11 +287,23 @@ def test_cli_regress_replays_the_project_regressions(tmp_path, memory, monkeypat
     out = json.loads((tmp_path / "out.json").read_text())
     assert out["passed"] == out["total"] == 1 and out["failed"] == []
     assert "1/1 passed" in capsys.readouterr().out
-    # a broken one fails the command
+    # evidence that differs from the recording's is listed, not a failure: the harness's done is the claim
     spec = regress.load(reg)
     spec["expect"]["evidence"]["near_coin"] = False
     with open(os.path.join(reg, regress.FILE), "w", encoding="utf-8") as f:
         json.dump(spec, f)
+    game, world, _ = sim.connect()
+    try:
+        assert cli.regress_on(game, "Tiny", args) == 0
+    finally:
+        world.close()
+    result = json.loads((tmp_path / "out.json").read_text())["results"][0]
+    assert result["passed"] and "near_coin: False then, True now" in result["differs"]
+    # a game change that keeps the claim from being shown (the harness never reaches done) fails the command
+    sim.write_memory(memory)  # (lib.arrived back to `< 10`: the player never "arrives" 28 cm away)
+    sim.fresh_imports(memory)
+    args = cli.parser().parse_args(["regress", "--recorded", "--retries", "0", "--seconds", "2", "--json",
+                                    str(tmp_path / "out.json")])
     game, world, _ = sim.connect()
     try:
         assert cli.regress_on(game, "Tiny", args) == 1
@@ -248,7 +351,7 @@ def test_the_replays_hold_the_link_as_a_run_does(tmp_path, monkeypatch):
     link = types.SimpleNamespace(hello={"project": "Tiny", "engine": "unreal"}, _state=state)
     monkeypatch.setattr(cli, "Game", lambda link, codex=None: "game")
     monkeypatch.setattr(cli.codexmod.Codex, "for_project", staticmethod(lambda project: None))
-    monkeypatch.setattr(cli, "regress_on", lambda game, project, args: held.append(dict(state)) or 0)
+    monkeypatch.setattr(cli, "regress_on", lambda game, project, args, **kw: held.append(dict(state)) or 0)
     assert cli.cmd_regress(link, cli.parser().parse_args(["regress", "--no-launch"])) == 0
     assert held == [{"run": {"project": "Tiny", "engine": "unreal"}}] and state == {}  # (held during, freed after)
 
@@ -256,62 +359,78 @@ def test_the_replays_hold_the_link_as_a_run_does(tmp_path, monkeypatch):
 def test_when_and_where_are_not_compared():
     """A replay that does what the recording did passes though its times and places moved a little (the agent's
     harnesses record when a lever was pulled, each HUD step's time, where the player ended): keys `t`, `..._t` and
-    `..._at` aren't compared, nor a regression's own "ignore"; what happened, how much and how long still are."""
-    then = {"opened": True, "pulled_at_t": 3.44, "player_at": [100, 2, 50], "seconds_open": 4.0,
-            "hud_steps": [{"t": 4.15, "from": 0, "to": 1}, {"t": 6.0, "from": 1, "to": 2}], "seed": 7}
-    now = {"opened": True, "pulled_at_t": 4.93, "player_at": [130, 2, 41], "seconds_open": 4.2,
-           "hud_steps": [{"t": 2.85, "from": 0, "to": 1}, {"t": 5.1, "from": 1, "to": 2}], "seed": 9}
-    assert regress.same(then, now, ignore={"seed"}) is None
-    assert "seed" in regress.same(then, now)
-    assert "hud_steps: [1]: to:" in regress.same(then, dict(now, hud_steps=[now["hud_steps"][0],
-                                                                              dict(now["hud_steps"][1], to=3)]))
-    assert "seconds_open" in regress.same(then, dict(now, seconds_open=9.0))  # (a duration is still compared)
+    `..._at` aren't listed as changed, nor a regression's own "ignore"; what happened, how much and how long are
+    listed when they changed."""
+    then = {"opened": True, "pulled_at_t": 3.44, "player_at": [100, 2, 50], "seconds_open": 4.0, "mode": "open",
+            "hud_steps": [{"t": 4.15, "from": 0, "to": 1}, {"t": 6.0, "from": 1, "to": 2}], "seed": "a7"}
+    now = {"opened": True, "pulled_at_t": 4.93, "player_at": [130, 2, 41], "seconds_open": 4.2, "mode": "open",
+           "hud_steps": [{"t": 2.85, "from": 0, "to": 1}, {"t": 5.1, "from": 1, "to": 2}], "seed": "b9"}
+    assert regress.differences(then, now, ignore={"seed"}) == []
+    assert regress.differences(then, now) == ["seed: 'a7' then, 'b9' now"]
+    assert regress.differences(then, dict(now, seconds_open=9.0), ignore={"seed"}) == [
+        "seconds_open: 4.0 then, 9.0 now"]
     assert regress.incidental("t") and regress.incidental("pulled_at_t") and regress.incidental("player_at")
     assert not regress.incidental("total") and not regress.incidental("attack")
     assert not regress.incidental("seconds_open") and not regress.incidental(3)
 
 
-def test_a_replay_that_fails_once_is_tried_again_and_called_flaky(monkeypatch):
-    """A failed replay is played again (no model: it costs only time); one that passes then is FLAKY, counted
-    passed and listed apart; one that fails every time fails. --retries 0 doesn't retry."""
-    outcomes = {"a": [False, True], "b": [False, False], "c": [True]}
-    played = []
+def test_a_replay_that_fails_is_tried_again_and_passes_on_the_first_try_that_does(monkeypatch):
+    """A replay that doesn't pass is played again, up to 3 tries by default, and passes on the first try that does
+    (a claim that something can happen holds when play shows it once; a game with bots doesn't always give the
+    chance). With live decisions that's play varying; with recorded ones every try plays the same, so a pass after a
+    failed try is FLAKY. One that fails every time fails. --retries 0: one try."""
+    played, traces = [], []
 
-    def replay(game, reg, **kw):
-        played.append(reg)
-        ok = outcomes[reg].pop(0) if len(outcomes[reg]) > 1 else outcomes[reg][0]
-        return {"id": reg, "prompt": reg, "passed": ok, "why": "as recorded" if ok else f"{reg} broke",
-                "seconds": 1.0}
+    def run(outcomes, **kw):
+        def replay(game, reg, **k):
+            played.append(reg)
+            traces.append(k.get("trace"))
+            ok = outcomes[reg].pop(0) if len(outcomes[reg]) > 1 else outcomes[reg][0]
+            return {"id": reg, "prompt": reg, "passed": ok, "why": "ended done" if ok else f"{reg} broke",
+                    "seconds": 1.0, "differs": ["ammo_now: 8 then, 20 now"] if ok else []}
 
-    monkeypatch.setattr(regress, "replay", replay)
+        monkeypatch.setattr(regress, "replay", replay)
+        return regress.replay_all(None, list(outcomes), **kw)
+
     said = []
-    results = regress.replay_all(None, ["a", "b", "c"], say=said.append)
-    assert played == ["a", "a", "b", "b", "c"]
+    results = run({"a": [False, False, True], "b": [False], "c": [True]}, say=said.append, client="jev",
+                  out_dir="out")
+    assert played == ["a", "a", "a", "b", "b", "b", "c"]
+    assert traces[:3] == [os.path.join("out", "a.jsonl"), os.path.join("out", "a-try2.jsonl"),
+                          os.path.join("out", "a-try3.jsonl")]
     s = regress.summary(results)
-    assert s["passed"] == 2 and s["failed"] == ["b"] and s["flaky"] == ["a"]
-    assert results[0]["why"] == "passed on try 2; the first: a broke" and said[0].startswith("  FLAKY a")
+    assert s["passed"] == 2 and s["failed"] == ["b"] and s["flaky"] == []  # (live: not flaky)
+    assert results[0]["tries"] == 3 and results[0]["earlier"] == ["a broke", "a broke"]
+    assert results[0]["why"] == "passed on try 3; before: a broke; a broke" and said[0].startswith("  ok    a")
+    assert "what changed (not compared): ammo_now: 8 then, 20 now" in said[0]
+    assert results[1]["why"] == "b broke (on each of 3 tries)" and results[1]["tries"] == 3
+    # recorded decisions: a pass after a failed try is flaky
     played.clear()
-    outcomes["a"] = [False, True]
-    regress.replay_all(None, ["a"], say=None, retries=0)
+    results = run({"a": [False, True]}, say=None)
+    assert results[0]["flaky"] and regress.summary(results)["flaky"] == ["a"] and played == ["a", "a"]
+    played.clear()
+    run({"a": [False, True]}, say=None, retries=0)
     assert played == ["a"]
-    assert cli.parser().parse_args(["regress", "--retries", "2"]).retries == 2
+    assert cli.parser().parse_args(["regress", "--retries", "0"]).retries == 0
+    assert cli.parser().parse_args(["regress"]).retries is None  # (regress.RETRIES: 2)
 
 
 def test_when_and_where_things_happened_are_not_compared():
     """When and where in the episode something happened differ from run to run (a replay's picks land a little earlier
     or later): the lever's pull at 3.44 s, replayed at 4.93 s, with the player a few studs elsewhere, is the same pull.
-    What happened is still compared."""
+    What happened is still listed when it changed."""
     recorded = {"gate_open_attr": True, "pulled_at_t": 3.44, "player_at": [1192.0, 8.0, 122.0],
                 "hud_steps": [{"t": 4.15, "hud_to": 1}, {"t": 11.7, "hud_to": 2}]}
     replayed = {"gate_open_attr": True, "pulled_at_t": 4.93, "player_at": [1188.0, -0.0, 122.0],
                 "hud_steps": [{"t": 2.85, "hud_to": 1}, {"t": 7.62, "hud_to": 2}]}
-    assert regress.same(recorded, replayed) is None
-    assert regress.same(recorded, dict(replayed, gate_open_attr=False)) == "gate_open_attr: True then, False now"
-    miscounted = [{"t": 2.85, "hud_to": 1}, {"t": 7.6, "hud_to": 3}]
-    assert "hud_to" in regress.same(recorded, dict(replayed, hud_steps=miscounted))
-    assert regress.same(recorded, {k: v for k, v in replayed.items() if k != "pulled_at_t"}) is None  # (not needed)
-    # (a duration is what a claim can be about: still compared)
-    assert "crack_to_gone_s" in regress.same({"crack_to_gone_s": 0.4}, {"crack_to_gone_s": 0.7})
+    assert regress.differences(recorded, replayed) == []
+    assert regress.differences(recorded, dict(replayed, gate_open_attr=False)) == [
+        "gate_open_attr: True then, False now"]
+    assert regress.differences(recorded, {k: v for k, v in replayed.items() if k != "pulled_at_t"}) == []
+    # (a duration varies with play: listed when it moved, never a failure; the harness's done is the claim)
+    assert regress.differences({"crack_to_gone_s": 0.4}, {"crack_to_gone_s": 0.6}) == []
+    assert regress.differences({"crack_to_gone_s": 4.0}, {"crack_to_gone_s": 7.0}) == [
+        "crack_to_gone_s: 4.0 then, 7.0 now"]
     assert regress.incidental("t") and regress.incidental("pulled_at_t") and regress.incidental("player_at")
     assert not any(regress.incidental(k) for k in ("seconds", "text", "attempts", "gate_open_attr", 3))
 
@@ -359,8 +478,8 @@ def test_regress_replays_the_ones_asked_and_tells_each_step(tmp_path, memory, ca
         regress.save(run_dir, report, "Tiny", project_root=memory)
     regs = os.path.join(memory, "regressions")
     out = tmp_path / "out"
-    args = cli.parser().parse_args(["regress", "--regressions", regs, "--only", "run-2,nope", "--events",
-                                    "--out", str(out)])
+    args = cli.parser().parse_args(["regress", "--recorded", "--regressions", regs, "--only", "run-2,nope",
+                                    "--events", "--out", str(out)])
     game, world, _ = sim.connect()
     try:
         assert cli.regress_on(game, "Tiny", args) == 0
@@ -377,7 +496,7 @@ def test_regress_replays_the_ones_asked_and_tells_each_step(tmp_path, memory, ca
     assert json.loads((out / "results.json").read_text())["results"][0]["id"] == "run-2"
     assert (out / "run-2.jsonl").exists() and not os.path.exists(os.path.join(regs, "run-2", "replay.jsonl"))
     # without --events: no JSON lines; without --out: a new results folder
-    args = cli.parser().parse_args(["regress", "--regressions", regs, "--only", "run-1"])
+    args = cli.parser().parse_args(["regress", "--recorded", "--regressions", regs, "--only", "run-1"])
     game, world, _ = sim.connect()
     try:
         assert cli.regress_on(game, "Tiny", args) == 0
