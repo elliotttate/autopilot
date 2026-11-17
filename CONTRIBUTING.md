@@ -255,7 +255,8 @@ the build and the game's Autopilot folder (`<game>/Autopilot`; its `regressions/
 It follows each command's events, so it shows what CI gets, and remembers its choices in `qa.json` in the settings
 folder.
 
-A replay restarts the level and plays the saved harness through the runtime, as an episode does, but its decisions come
+A replay restarts the level the regression was played on (its `map`: the run's level, else the one the editor played;
+a harness's `start_map` wins) and plays the saved harness through the runtime, as an episode does, but its decisions come
 from the recorded picks (`regress.ReplayJev`): no agent and no Jev are called. It passes when the episode ends in the
 recorded state with the same evidence (booleans, strings and None equal; numbers within the regression's `tolerance`,
 0.25 relative by default), and says why when it doesn't (`ended running (...), not done`, `evidence differs: coins: 1
@@ -264,7 +265,8 @@ then, 2 now`). When and where things happened (evidence keys `t`, `..._t`, `..._
 (`--retries`): one that passes then is reported FLAKY, counted as passed and listed apart, which usually means its
 harness reads the game too tightly. It imports the project's lib.py as it is now, so a change to lib.py that breaks an old verification shows
 (`--frozen-lib`: each regression's own snapshot). `--seconds` caps each episode (default 1.5x the recorded one, at least
-20 s). The command exits 0 when every regression passes, 1 otherwise.
+20 s). A build starts in its default map, often a menu: `--level /Game/Maps/Arena` replays a regression saved before
+regressions kept their level in that level. The command exits 0 when every regression passes, 1 otherwise.
 
 ## Testing a build
 

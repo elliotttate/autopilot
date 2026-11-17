@@ -31,11 +31,13 @@ play needs that state, which a replay can't rebuild): the latest such episode th
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
 import types
 
+from . import levels as levelsmod
 from . import runtime
 
 FILE = "regression.json"
@@ -162,9 +164,30 @@ def confirming_episode(run_dir):
 
 # -- saving --------------------------------------------------------------------------------------------------------
 
-def save(run_dir, report, project, project_root=None, dest=None):
+def level_of(game):
+    """The level a run's episodes played on game, as a replay opens it, or None when it isn't known: the run's level
+    (game.level: asked for, or restarted into), else the one the game played (cli.prepare's Level: playing, else the
+    editor's open one). As the project's list of levels names it when it is listed; a PIE world's prefix dropped
+    (/Game/Maps/UEDPIE_0_Arena -> /Game/Maps/Arena). A replay on a build needs it: a build starts in its default map
+    (often a menu), not the level the editor had open."""
+    info = getattr(game, "level_info", None)
+    for found in (getattr(game, "level", None), getattr(info, "playing", None), getattr(info, "open", None)):
+        found = str(found or "").strip()
+        if not found:
+            continue
+        listed = [p for p in (getattr(info, "levels", None) or []) if levelsmod.same(p, found)]
+        if listed:
+            return listed[0]
+        head, _, tail = found.replace("\\", "/").rpartition("/")
+        tail = re.sub(r"^UEDPIE_\d+_", "", tail)
+        return f"{head}/{tail}" if head else tail
+    return None
+
+
+def save(run_dir, report, project, project_root=None, dest=None, level=None):
     """Keep a CONFIRMED verification's harness as a regression; its folder, or None (not a confirmed claim, or no
-    episode a replay can play: see the module's docstring)."""
+    episode a replay can play: see the module's docstring). level: the level the episode played (level_of), kept as
+    regression.json's `map` for the replay to open."""
     if str(report.get("outcome") or "").strip().upper() != "CONFIRMED":
         return None
     found = confirming_episode(run_dir)
@@ -185,6 +208,8 @@ def save(run_dir, report, project, project_root=None, dest=None):
         "expect": ep["end"], "picks": ep["picks"], "extras": ep["extras"], "played_seconds": ep["t"],
         "tolerance": TOLERANCE,
     }
+    if level:
+        spec["map"] = level
     with open(os.path.join(dest, FILE), "w", encoding="utf-8") as f:
         json.dump(runtime.jsonable(spec), f, indent=1)
     return dest
@@ -193,7 +218,8 @@ def save(run_dir, report, project, project_root=None, dest=None):
 def save_from_session(session, report):
     """agents/session.finish's hook: the run's regression when it CONFIRMED a claim (never raises)."""
     try:
-        return save(session.run_dir, report, session.project, project_root=session.root)
+        return save(session.run_dir, report, session.project, project_root=session.root,
+                    level=level_of(getattr(session, "game", None)))
     except Exception as e:
         try:
             session.note(f"couldn't save the regression: {type(e).__name__}: {e}")
@@ -347,10 +373,18 @@ def _load_harness(reg, lib_dir):
             pass
 
 
-def replay(game, reg, project_root=None, frozen_lib=False, seconds=None, restart=True, trace=None):
+def start_level(harness, spec, level=None):
+    """The level a replay restarts into: the harness's start_map, else the level the regression was played on (its
+    `map`), else `level` (`regress --level`: for regressions saved before they kept it), else None (the level the game
+    is on starts over)."""
+    return getattr(harness, "start_map", None) or spec.get("map") or level or None
+
+
+def replay(game, reg, project_root=None, frozen_lib=False, seconds=None, restart=True, trace=None, level=None):
     """Play regression reg (its folder) again on game, without a model: {"id", "passed", "why", "state", "evidence",
     "decisions", "seconds", "trace"}. lib: the project's live lib.py (project_root) unless frozen_lib, or there is
-    none: then the snapshot saved with it. trace: where the replay's trace goes (default: replay.jsonl in reg)."""
+    none: then the snapshot saved with it. trace: where the replay's trace goes (default: replay.jsonl in reg).
+    level: the level to replay in when neither the harness nor the regression names one (start_level)."""
     spec = load(reg)
     started = time.time()
     out = {"id": spec.get("id") or os.path.basename(reg), "prompt": spec.get("prompt"), "passed": False, "why": "",
@@ -371,7 +405,7 @@ def replay(game, reg, project_root=None, frozen_lib=False, seconds=None, restart
     os.makedirs(os.path.dirname(os.path.abspath(trace)), exist_ok=True)
     try:
         if restart:
-            game.restart(map=getattr(harness, "start_map", None))
+            game.restart(map=start_level(harness, spec, level))
         game.pause(False)
         rt = runtime.Runtime(game, harness, trace, client=ReplayJev(spec.get("picks"), spec.get("extras")),
                              max_seconds=limit)
@@ -403,25 +437,28 @@ def replay(game, reg, project_root=None, frozen_lib=False, seconds=None, restart
 
 
 def replay_all(game, regs, project_root=None, frozen_lib=False, seconds=None, say=print, retries=RETRIES,
-               out_dir=None, on_event=None):
+               out_dir=None, on_event=None, level=None):
     """replay() of each regression folder in regs, one after another (one game): their results. One that fails is
     replayed again, up to `retries` times (a replay costs no model): one that then passes is FLAKY (its "flaky": it
     passed, but not every time: its harness reads the game too tightly, or the game itself varies). out_dir: where
     the replays' traces go (<id>.jsonl; default: in each regression's folder). on_event: told
-    {"event": "replaying", "id", "try"} as each replay starts and {"event": "result", **result} as each ends."""
+    {"event": "replaying", "id", "try"} as each replay starts and {"event": "result", **result} as each ends. level:
+    the level to replay those that don't name one in (start_level)."""
     results = []
     tell = on_event or (lambda event: None)
     for reg in regs:
         rid = describe(reg)["id"]
         trace = os.path.join(out_dir, f"{rid}.jsonl") if out_dir else None
         tell({"event": "replaying", "id": rid, "try": 1})
-        r = replay(game, reg, project_root=project_root, frozen_lib=frozen_lib, seconds=seconds, trace=trace)
+        r = replay(game, reg, project_root=project_root, frozen_lib=frozen_lib, seconds=seconds, trace=trace,
+                   level=level)
         first = r
         for k in range(max(0, retries)):
             if r["passed"]:
                 break
             tell({"event": "replaying", "id": rid, "try": k + 2, "why": r["why"]})
-            r = replay(game, reg, project_root=project_root, frozen_lib=frozen_lib, seconds=seconds, trace=trace)
+            r = replay(game, reg, project_root=project_root, frozen_lib=frozen_lib, seconds=seconds, trace=trace,
+                   level=level)
             if r["passed"]:
                 r = dict(r, flaky=True, why=f"passed on try {k + 2}; the first: {first['why']}")
         results.append(r)

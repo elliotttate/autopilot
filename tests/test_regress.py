@@ -119,6 +119,43 @@ def test_session_finish_saves_the_regression(tmp_path, memory, monkeypatch):
     assert seen == ["CONFIRMED"]
 
 
+def test_a_regression_keeps_its_level_and_a_replay_opens_it(tmp_path, memory):
+    """A build starts in its default map (often a menu), not the level the editor had open: a regression keeps the
+    level its episode played and a replay opens it; one saved before that is replayed in --level."""
+    level = types.SimpleNamespace(levels=["/Game/Maps/Arena", "/Game/Maps/Menu"], open="/Game/Maps/Menu",
+                                  playing="/Game/Maps/UEDPIE_0_Arena.Arena")
+    # the run's level, else the one the game played (as the list names it), else the editor's open one
+    assert regress.level_of(types.SimpleNamespace(level="/Game/Maps/Menu", level_info=level)) == "/Game/Maps/Menu"
+    assert regress.level_of(types.SimpleNamespace(level=None, level_info=level)) == "/Game/Maps/Arena"
+    unlisted = types.SimpleNamespace(levels=[], open="", playing="/Game/Maps/UEDPIE_0_Arena")
+    assert regress.level_of(types.SimpleNamespace(level=None, level_info=unlisted)) == "/Game/Maps/Arena"
+    assert regress.level_of(types.SimpleNamespace(level=None, level_info=None)) is None
+    assert regress.level_of(None) is None
+
+    run_dir, report = confirmed(tmp_path, memory)
+    session = types.SimpleNamespace(run_dir=run_dir, project="Tiny", root=memory, note=lambda text: None,
+                                    game=types.SimpleNamespace(level=None, level_info=level))
+    reg = regress.save_from_session(session, report)
+    assert regress.load(reg)["map"] == "/Game/Maps/Arena"
+
+    game, world, _ = sim.connect()
+    opened = []
+    restart = game.restart
+    game.restart = lambda map=None, **kw: opened.append(map) or restart(**kw)
+    try:
+        assert regress.replay(game, reg, project_root=memory)["passed"]
+        old = regress.save(run_dir, report, "Tiny", project_root=memory, dest=str(tmp_path / "old"))
+        assert "map" not in regress.load(old)
+        regress.replay_all(game, [old], project_root=memory, say=None, level="/Game/Maps/Other")
+        regress.replay(game, old, project_root=memory)
+    finally:
+        world.close()
+    assert opened == ["/Game/Maps/Arena", "/Game/Maps/Other", None]
+    # the harness's own start_map wins over both
+    assert regress.start_level(types.SimpleNamespace(start_map="/Game/S"), {"map": "/Game/M"}, "/Game/L") == "/Game/S"
+    assert cli.parser().parse_args(["regress", "--level", "/Game/Maps/Arena"]).level == "/Game/Maps/Arena"
+
+
 def test_evidence_comparison():
     assert regress.same({"a": True, "n": 10, "s": "x"}, {"a": True, "n": 11, "s": "x", "extra": 1}) is None
     assert "a:" in regress.same({"a": True}, {"a": False})

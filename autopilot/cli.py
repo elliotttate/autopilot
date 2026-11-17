@@ -1110,7 +1110,8 @@ def regress_on(game, project, args, say=print):
         results = regress.replay_all(game, regs, project_root=root, frozen_lib=getattr(args, "frozen_lib", False),
                                      seconds=getattr(args, "seconds", None), say=say,
                                      retries=getattr(args, "retries", regress.RETRIES), out_dir=out,
-                                     on_event=lambda e: regress_event(args, e.pop("event"), **e))
+                                     on_event=lambda e: regress_event(args, e.pop("event"), **e),
+                                     level=getattr(args, "level", None))
         summary = regress.summary(results)
         say(f"{summary['passed']}/{summary['total']} passed"
             + (f" ({len(summary['flaky'])} flaky: passed only on a retry)" if summary["flaky"] else ""))
@@ -1490,6 +1491,9 @@ def parser():
     rg.add_argument("--connect-timeout", type=float, default=180.0,
                     help="seconds a game this starts has to connect (default 180)")
     rg.add_argument("--seconds", type=float, help="each replay's longest episode (default: 1.5x the recorded one)")
+    rg.add_argument("--level", help="the level to replay a regression in when it doesn't name one (one saved before "
+                                    "regressions kept their level): a path such as /Game/Maps/Arena; a build starts "
+                                    "in its default map, often a menu")
     rg.add_argument("--frozen-lib", action="store_true",
                     help="use each regression's own lib.py snapshot, not the project's lib.py now")
     rg.add_argument("--json", help="write the results there")
