@@ -228,3 +228,37 @@ def test_starts_at_once_each_wait_apart(monkeypatch):
     assert front.call("wait", {"run": "start-1"})["content"][0]["text"].startswith("Autopilot run r1-x")
     assert front.runs == {"r1-x": "http://s", "r2-x": "http://s"}
     assert mcp.with_run({"type": "object", "properties": {}})["properties"]["run"] == mcp.RUN_PROPERTY
+
+
+def test_calls_made_one_after_another_still_play_side_by_side(monkeypatch):
+    # (Claude Code makes an agent's calls on the game one at a time, even those it sends together: while several runs
+    # started here go, each answers "still going" soon, so the next run's episode starts while this one's plays)
+    monkeypatch.setattr(mcp, "WAIT_SECONDS", 5)
+    monkeypatch.setattr(mcp, "SHARED_WAIT_SECONDS", 0.2)
+    playing, release = set(), threading.Event()
+
+    class Front(mcp.Server):
+        def post(self, url, body):
+            if url.endswith("/report"):
+                return mcp.text("Reported. You can stop now.")
+            playing.add(body["run"])
+            release.wait(5)
+            return mcp.text(f"episode of {body['run']}")
+
+    front = Front(out=None, find=lambda: (["http://s"], None))
+    front.runs = {"r1-a": "http://a", "r2-b": "http://b", "r3-c": "http://c"}
+    started = time.time()
+    for run in front.runs:
+        answer = front.call("run_harness", {"run": run, "seconds": 60})["content"][0]["text"]
+        assert "still going" in answer and "plays on meanwhile" in answer
+    assert playing == {"r1-a", "r2-b", "r3-c"} and time.time() - started < 3
+    release.set()
+    for run in ("r2-b", "r1-a", "r3-c"):  # (the waits a client makes side by side)
+        assert front.call("wait", {"run": run})["content"][0]["text"] == f"episode of {run}"
+    # Once the others have reported, the one left waits its whole time again
+    front.call("report", {"run": "r1-a", "outcome": "CONFIRMED"})
+    front.call("report", {"run": "r3-c", "outcome": "CONFIRMED"})
+    assert front.ended == {"r1-a", "r3-c"} and not front.side_by_side()
+    release.clear()
+    threading.Timer(0.5, release.set).start()
+    assert front.call("run_harness", {"run": "r2-b", "seconds": 60})["content"][0]["text"] == "episode of r2-b"

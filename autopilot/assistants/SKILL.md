@@ -45,6 +45,9 @@ Autopilot plays up to three games side by side in the editor (Unreal), one run i
 - Every run has its own id (start_run answers with it): pass it as `run` with every Autopilot call of that run, and
   to its frame describer and episode reviewer. A run's subagent that can't start subagents of its own looks at the
   picture with `describe_frames` (Autopilot's own describer) instead.
+- Working several runs yourself instead, keep their games playing together: make each run's `run_harness` (or
+  `probe`) call in one message; while several runs go, each answers "still going" within seconds and plays on, so
+  every run's episode starts at once. Then call `wait` for each of them, in one message.
 - Don't end your turn while a run's subagent is still going: wait for each one's result (a session run without a
   person, `claude -p` or `codex exec`, ends with your turn, and its subagents with it).
 - When every run has reported, tell the user each request's outcome in one line, in their order (a table when they

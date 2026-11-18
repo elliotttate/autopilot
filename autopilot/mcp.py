@@ -11,7 +11,9 @@ call, Codex after 60 s) answers "still going", and `wait` gives its result.
 
 Several runs may go at once, each in a game of its own (Unreal's editor plays them side by side: start_run's
 `parallel`): start_run answers with the run's id, and every other call names its run (`run`). A client whose subagents
-share this server (Claude Code's) works on several runs through it; a call that names no run is the only run's.
+share this server (Claude Code's) works on several runs through it; a call that names no run is the only run's. While
+several runs started here go, a call on the game answers "still going" after SHARED_WAIT_SECONDS: a client that makes
+its calls one at a time (Claude Code, for calls that aren't read-only) then has every run's episode playing at once.
 
 A program that runs an agent service of its own and sets this server up for its own agent says which service to use:
 AUTOPILOT_MCP_BRAIN names a brain file (what that service announced: its "control" address), and then no other service
@@ -31,6 +33,10 @@ import urllib.request
 
 PROTOCOL = "2025-06-18"
 WAIT_SECONDS = float(os.environ.get("AUTOPILOT_MCP_WAIT") or 40)  # (under Codex's 60 s for one call)
+# How long a call on the game waits for its result while several runs started here go: Claude Code makes an agent's
+# calls on the game one after another, even those it sends together, so each answers "still going" soon and the next
+# run's episode starts while this one's plays (wait, which a client may make side by side, gives the results)
+SHARED_WAIT_SECONDS = float(os.environ.get("AUTOPILOT_MCP_WAIT_SHARED") or 3)
 
 INSTRUCTIONS = ("Autopilot playtests the game open in the user's game editor (Unreal, Unity, Godot or Roblox Studio): "
                 "call start_run with the user's request (explore it, test it, verify a claim, reach a goal), then "
@@ -176,6 +182,7 @@ class Server:
         self.control = None  # the address the latest run was started at
         self.run = None  # its marker
         self.runs = {}  # every run started here: its marker -> the address it was started at
+        self.ended = set()  # ... the ones reported
         self.starts = 0  # start_run calls so far (one still going waits as "start-<n>")
         self.pending = {}  # the calls still going, by the run they are for ("": one that named none): (thread, box,
         # tool, started)
@@ -236,7 +243,11 @@ class Server:
         if control is None and run is None and self.runs:
             control = self.control
         if control is not None:
-            return plain(self.post(f"{control}/call/{name}", body))
+            answer = plain(self.post(f"{control}/call/{name}", body))
+            if name == "report" and run and not answer.get("isError") and any(
+                    str(c.get("text", "")).startswith("Reported") for c in answer.get("content") or []):
+                self.ended.add(run)
+            return answer
         # (a front that started no run works on the run named, or the run going: Codex starts one of these for each of
         # its subagents, the frames' describer among them)
         return plain(self.first_taker(f"call/{name}", body, "going")[1])
@@ -274,14 +285,21 @@ class Server:
                 thread.start()
                 pending = self.pending[key] = (thread, box, name, time.time())
         thread, box, tool, started = pending
-        thread.join(WAIT_SECONDS)
+        shared = name not in ("wait", "start_run") and self.side_by_side()
+        thread.join(SHARED_WAIT_SECONDS if shared else WAIT_SECONDS)
         with self.lock:
             if thread.is_alive():
                 return text(f"{tool} is still going ({time.time() - started:.0f} s): call wait for its result"
-                            + (f" (run=\"{key}\")." if key else "."))
+                            + (f" (run=\"{key}\")" if key else "")
+                            + ("; it plays on meanwhile: make the other runs' calls first, then wait for each (the "
+                               "waits side by side)." if shared else "."))
             if self.pending.get(key) is pending:
                 self.pending.pop(key, None)
             return box.get("result") or text(f"{tool} gave no result.", error=True)
+
+    def side_by_side(self):
+        """Whether several runs started here go (not reported yet)."""
+        return len([run for run in self.runs if run not in self.ended]) > 1
 
     def handle(self, msg):
         method, mid = msg.get("method"), msg.get("id")
