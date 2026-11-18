@@ -113,12 +113,12 @@ private:
 	struct FJobs;
 
 	/** "" and the game viewport's rectangle in its window's back buffer, or why there is no picture ("no picture: ...").
-	 *  World: whose picture (a player's world; a recording is always player 1's). */
+	 *  World: whose picture (a player's world: each player is recorded apart). */
 	FString FindPicture(UWorld* World, FIntRect& OutRect, const SWindow*& OutWindow);
 	/** Hooks the render thread's side to Slate's presents (once). */
 	bool Hook();
-	bool Start(UWorld* World, bool bStill, int64 Number, int32 MaxDim, int32 Quality, FString& OutError);
-	void StopRecording();
+	bool Start(UWorld* World, int32 Player, bool bStill, int64 Number, int32 MaxDim, int32 Quality, FString& OutError);
+	void StopRecording(int32 Player);
 
 	UPlaytestSubsystem& Bridge;
 	TUniquePtr<FJobs> Jobs;
@@ -127,15 +127,20 @@ private:
 	TWeakPtr<SViewport> ViewportWidget;  // the viewport last seen, and its window
 	TWeakPtr<SWindow> ViewportWindow;
 
-	bool bRecording = false;
-	double Interval = 0.2;
-	int32 RecordMaxDim = 960;
-	int32 RecordQuality = 75;
-	double NextFrame = 0.0;  // FPlatformTime; 0: at once
-	int64 NextN = 0;
-	int64 FramesSent = 0;
-	int32 RecordSerial = 0;  // the connection the recording was started on
-	int32 Generation = 0;    // bumped at each start and stop: older frames in flight are dropped
+	/** One player's recording: each player of the play session is recorded apart (`record` with its "player"). */
+	struct FRecording
+	{
+		double Interval = 0.2;
+		int32 MaxDim = 960;
+		int32 Quality = 75;
+		double NextFrame = 0.0;  // FPlatformTime; 0: at once
+		int64 NextN = 0;
+		int64 FramesSent = 0;
+		int32 Serial = 0;      // the connection the recording was started on
+		int32 Generation = 0;  // this recording's: frames still in flight from an earlier one are dropped
+	};
+	TMap<int32, FRecording> Recordings;  // by player
+	int32 Generation = 0;  // the latest recording's
 };
 
 /** Captures engine errors, ensure failures and Blueprint runtime errors from the log (any thread). */

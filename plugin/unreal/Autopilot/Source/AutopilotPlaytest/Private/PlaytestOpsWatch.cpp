@@ -223,7 +223,7 @@ namespace
 		Pending.Seconds = NumberField(Args, TEXT("seconds"), 0.6);
 		Pending.Tick = [&Bridge, State, LookState, Turned, MovedLimit, Resized, bDrawn, Watcher](FPending& P, double Now)
 		{
-			const double GameTime = FMath::Max(0.0, Bridge.GameTime());
+			const double GameTime = FMath::Max(0.0, Bridge.GameTime(Watcher));  // (the watcher's game's clock)
 			UWorld* World = Bridge.GetPlayerWorld(Watcher);
 			const APlayerController* PC = PlayerController(World);
 			const APawn* Pawn = PC ? PC->GetPawn() : nullptr;

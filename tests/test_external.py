@@ -141,7 +141,7 @@ def test_an_argument_name_a_tool_doesnt_take_is_refused_never_dropped(started):
     words = text_of(refused)
     assert refused["isError"] and control.desk is None
     assert words.startswith("start_run: unknown argument(s) frames_fps; it takes request, kind, minutes, "
-                            "time_limit_minutes, level. frames_fps is an argument of run_harness.")
+                            "time_limit_minutes, level, parallel. frames_fps is an argument of run_harness.")
     assert "Nothing was done" in words
     settled(front, front.call("start_run", {"request": "Reach the gate"}))
     desk = control.desk
@@ -151,11 +151,11 @@ def test_an_argument_name_a_tool_doesnt_take_is_refused_never_dropped(started):
     refused = front.call("run_harness", {"seconds": 10, "fps": 30, "Restart": False})
     assert refused["isError"] and not calls
     assert text_of(refused).startswith("run_harness: unknown argument(s) fps, Restart; it takes seconds, restart, "
-                                       "frames_fps.")
+                                       "frames_fps, run.")
     refused = front.call("report", {"outcome": "achieved", "summary": "s", "evidence": [], "notes": "x"})
     assert refused["isError"] and desk.session.report is None
     assert "unknown argument(s) notes; it takes outcome, summary, evidence, findings, visual" in text_of(refused)
-    assert "it takes no arguments" in text_of(front.call("snapshot", {"what": "all"}))
+    assert "it takes run" in text_of(front.call("snapshot", {"what": "all"}))  # (every call may name its run)
     restarted = text_of(front.call("restart_level", {"episode": 2}))
     assert "episode is an argument of describe_frames and report and frames" in restarted
     assert "unknown argument(s) file" in text_of(front.call("read_file", {"file": "runs/r1/REQUEST.md"}))

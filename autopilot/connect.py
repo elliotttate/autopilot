@@ -34,17 +34,18 @@ CLAUDE_REVIEWER, CODEX_REVIEWER = "episode-reviewer", "episode_reviewer"
 DESCRIBER_ABOUT = ("Describes frames of an Autopilot episode (the autopilot `frames` tool) for an agent checking how "
                    "something in a game looks. Give it only the episode, the times in it (seconds from its start, as "
                    "its summary's t=) and open questions: never the claim, the request or what you expect to see.")
-DESCRIBER_HOW = ("You are given an episode, times in it (seconds from its start) and open questions. Call the "
-                 "autopilot `frames` tool with that episode, start, end and count, then describe the frames you get, "
-                 "answering each question by its number from the frames alone. If `frames` gives no pictures, say "
-                 "what it said instead and stop.")
+DESCRIBER_HOW = ("You are given an episode, times in it (seconds from its start), open questions and the run's id. "
+                 "Call the autopilot `frames` tool with that run, episode, start, end and count, then describe the "
+                 "frames you get, answering each question by its number from the frames alone. If `frames` gives no "
+                 "pictures, say what it said instead and stop.")
 REVIEWER_ABOUT = ("Reviews one Autopilot episode (its trace summary, what the picture showed, the harness that "
                   "played it) and proposes the one change for the next harness. Give it the run's folder (runs/<id>) "
                   "and the episode's number; it reads with Autopilot's file tools and looks at frames where a "
                   "death's cause is unclear. It can't act on the game or write.")
 REVIEWER_HOW = """You review one episode of an Autopilot run for the agent writing the harness, and propose the one
-change to make next. You are given the run's folder (runs/<id>, relative to the game's folder) and the episode's number
-n. With the autopilot `read_file` tool read runs/<id>/trace<n>_summary.txt (how each option fared, the timeline, where
+change to make next. You are given the run's folder (runs/<id>, relative to the game's folder), the run's id (pass it as
+`run` with every autopilot call: several runs may go at once) and the episode's number n. With the autopilot
+`read_file` tool read runs/<id>/trace<n>_summary.txt (how each option fared, the timeline, where
 the plan got, "What the picture showed": each death's cause as a model saw it in the frames, with a sentence; the
 executors' step times) and runs/<id>/harness<n>.py; `search` and `read_file` for lib.py, notes.md and
 runs/<id>/findings.md as you need them. Where the summary leaves a death's or a stall's cause unclear, or the numbers

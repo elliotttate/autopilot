@@ -211,7 +211,7 @@ namespace PlaytestOps
 		}
 		else if (Op == TEXT("ping"))
 		{
-			Ping(Bridge, Id);
+			Ping(Bridge, Id, Args);
 		}
 		else if (Op == TEXT("record"))
 		{

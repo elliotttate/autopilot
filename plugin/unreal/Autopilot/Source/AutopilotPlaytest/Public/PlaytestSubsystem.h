@@ -200,6 +200,16 @@ public:
 	/** Set by the editor module: starts/stops PIE. Without it (a game build), restart reopens the launch map. */
 	FPlaytestSessionHandler SessionHandler;
 
+	/** Set by the editor module: starts Play In Editor as Instances games side by side (standalone, run under one
+	 *  process: one window each, each a game of its own that one run plays as its player n), in the level Map when
+	 *  given; one playing otherwise is stopped first. Calls Done(running) once every game plays. Never changes the
+	 *  user's Play settings (the session is started with a copy). */
+	TFunction<void(int32 /*Instances*/, const FString& /*Map*/, TFunction<void(bool, const FString&)> /*Done*/)> InstancesHandler;
+
+	/** Whether the players being played are games of their own, side by side (more than one player world, none of
+	 *  them networked: standalone Play In Editor instances): each is restarted, paused and recorded apart. */
+	bool PlaysInstances() const;
+
 	/** Set by the editor module: whether a play session has been asked for and hasn't started yet. */
 	TFunction<bool()> SessionRequested;
 
@@ -265,6 +275,9 @@ public:
 
 	/** Game time of the played world, or a negative number when there is none. */
 	double GameTime() const;
+	/** Game time of player N's world (GetPlayerWorld), or a negative number when there is none: the clock a request for
+	 *  that player is answered by (each of the games an editor plays side by side has its own). */
+	double GameTime(int32 Player) const;
 
 	// Used by the request handlers
 	struct FPending
@@ -368,6 +381,9 @@ private:
 	FCriticalSection IncomingLock;
 	TArray<TSharedPtr<FJsonValue>> OutgoingEvents;
 	TArray<FPending> PendingOps;
+	/** The player each request still unanswered is for, when it isn't player 1: its answer carries that player's game
+	 *  time ("t"). */
+	TMap<int64, int32> RequestPlayers;
 
 	TSharedPtr<FJsonObject> CommandLineRun;  // from -Playtest=...
 	FString CommandLineReportDir;

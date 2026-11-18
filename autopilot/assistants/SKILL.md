@@ -23,14 +23,32 @@ and revise the harness, and report what play showed. Its tools come from the `au
    how to work, what the kit is, and the rules a report must meet.
 4. A call that answers "still going" (an episode, the game starting) isn't done: call `wait` until it gives the
    result.
-5. To look at the game's picture, never call `frames` yourself: hand the episode, the times in it (seconds from its
-   start, as its run_harness summary's t= gives them) and open questions (nothing about the request or what you
-   expect) to the `frame-describer` subagent, as INSTRUCTIONS.md says.
+5. To look at the game's picture, never call `frames` yourself: hand the run's id, the episode, the times in it
+   (seconds from its start, as its run_harness summary's t= gives them) and open questions (nothing about the request
+   or what you expect) to the `frame-describer` subagent, as INSTRUCTIONS.md says.
 6. If start_run asks for the decision model's key, tell the user where it goes (the file or the Autopilot tab it
    names). Never ask them to paste a key into this conversation.
 7. Name in `report`'s `episode` the episode that shows the result best: its recording is the one the user watches.
    Once `report` says "Reported", the run is over: tell the user its outcome in a few lines. The Autopilot tab in
    their editor shows the whole result, with the recording.
+
+## Several requests at once
+
+When the user gives several requests to go through (a list, a spreadsheet, a CSV of prompts), run them in batches:
+Autopilot plays up to three games side by side in the editor (Unreal), one run in each.
+
+- Give each request to a subagent of its own, in the background, with the request, its kind and these steps 2-7 (the
+  subagent calls `start_run` itself and works its run to the report); start at most three at once and, as each one
+  reports, start the next. Each start passes `parallel` set to the number you keep going (3, or fewer when there are
+  fewer requests): the first start of a batch starts that many games side by side; a start while that many runs go is
+  refused until one reports.
+- Every run has its own id (start_run answers with it): pass it as `run` with every Autopilot call of that run, and
+  to its frame describer and episode reviewer. A run's subagent that can't start subagents of its own looks at the
+  picture with `describe_frames` (Autopilot's own describer) instead.
+- Don't end your turn while a run's subagent is still going: wait for each one's result (a session run without a
+  person, `claude -p` or `codex exec`, ends with your turn, and its subagents with it).
+- When every run has reported, tell the user each request's outcome in one line, in their order (a table when they
+  gave a table).
 
 Use Autopilot's own file tools for the game's folder (paths relative to it), never your own, and don't change the
 user's project or the game's files: the game is acted on only through play, with Autopilot's tools. The user can

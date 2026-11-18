@@ -6,8 +6,9 @@ Autopilot tab, the memory and (shared) the run's data.
     Control     in `autopilot serve` (the agent service the editor's plugin started): a localhost endpoint whose address
                 (with a secret) brain.json gives as "control", which `autopilot mcp` finds it by. POST <control>/start
                 starts a run with this module as its agent (cmd_serve decides whether one may start); POST
-                <control>/call/<tool> is a tool call on the run going. Answers are an MCP tool result as JSON
-                ({"content": [...], "isError"}).
+                <control>/call/<tool> is a tool call on a run going: the one its body's "run" names (several may go at
+                once, each in a game of its own: cmd_serve), else the only one going. Answers are an MCP tool result as
+                JSON ({"content": [...], "isError"}).
     Desk        one run's: the start call's answer once its session is open, then each tool call handed to the session
                 (one at a time, as every agent's), until the run ends.
     implement() the agent's entry point, as every agent's: the session opened, INSTRUCTIONS.md (the instructions every
@@ -58,6 +59,8 @@ IDLE_SECONDS = 20 * 60
 END_GRACE = 30.0
 # After the report, before the agent's transcript is kept (a shared run): its client writes the report's result first
 TRANSCRIPT_DELAY = 3.0
+# Runs that have ended whose desks are kept (their frames still answer a describer), the latest ones
+KEPT_ENDED = 20
 GAME_TOOLS = ("probe", "run_harness", "snapshot", "describe_frames", "frames", "restart_level", "report")
 
 EXTERNAL_TOOLS = """## Your tools here
@@ -75,6 +78,10 @@ long (an episode, starting the game) answers "still going": call wait until it g
 "Reported", the run is over: tell the user its outcome in a few lines (the Autopilot tab in their editor shows the
 whole result). Only `frames` still answers then, on the frames the run kept (a describer still looking).
 
+This run's id is {marker}. Pass run="{marker}" with every Autopilot tool call (wait and the file tools too): other runs
+may go at the same time through the same Autopilot, each in a game of its own, and a call that names no run is refused
+while several go.
+
 ## Looking at the picture here
 
 Here describe_frames above means a describer subagent of yours, not a model of Autopilot's: hand it the moment, it
@@ -83,7 +90,7 @@ reading frames while you know what you hope to see colours what you see. Brief i
 else (never the request, the claim, the harness or what you expect); each <t> is seconds from the episode's start, as
 its run_harness summary's t= gives them:
 
-    Call the autopilot tool `frames` with episode=<n>, start=<t>, end=<t>, count=<up to {max_frames}>.
+    Call the autopilot tool `frames` with run="{marker}", episode=<n>, start=<t>, end=<t>, count=<up to {max_frames}>.
     Then describe the frames. {describer}
     Questions:
     1. <an open question: what moves and how, what is at a spot, what the text says; never yes/no>
@@ -100,22 +107,25 @@ pictures: it works only where the user has a key (or Aura) for one.
 
 After an episode with deaths, failed options or a stall whose causes the summary doesn't settle, hand it to the
 `episode-reviewer` subagent (Claude Code; `episode_reviewer` in Codex) in the same turn as you read the summary
-yourself: tell it the run's folder ({run}) and the episode's number, nothing else. It reads the trace summary, "What
+yourself: tell it the run's folder ({run}), the run's id ({marker}: it passes run="{marker}" with its calls) and the
+episode's number, nothing else. It reads the trace summary, "What
 the picture showed" and the harness with Autopilot's file tools, looks at the frames where a cause is unclear, and
 answers with each death's cause and the one change to make first. Check its proposal against the code (and a probe)
 before the harness takes it. Not needed for an episode the summary explains: then make the change yourself.
 """
 
 START = """Autopilot run {marker} started on {project}: the game is open in the user's editor and paused between your
-calls. First read {instructions} with read_file, all of it (in parts: it is long): it is how to work and what the kit
-is. The request and its briefing follow (also in {request}).
+calls. Pass run="{marker}" with every Autopilot tool call (other runs may go at the same time). First read
+{instructions} with read_file, all of it (in parts: it is long): it is how to work and what the kit is. The request and
+its briefing follow (also in {request}).
 
 {message}"""
 
 # The start call's answer when the request message is longer than one tool result holds (whole.RESULT_CHARS): it is
 # whole in REQUEST.md, and the agent reads both files with read_file
 START_LONG = """Autopilot run {marker} started on {project}: the game is open in the user's editor and paused between
-your calls. The request: {prompt}
+your calls. Pass run="{marker}" with every Autopilot tool call (other runs may go at the same time).
+The request: {prompt}
 
 Its briefing (what you would read first: notes.md, lib.py, earlier runs, what changed in the codex, where the request's
 words are, what the live game shows now) is {size:,} characters, more than one tool result holds, so it is in a file.
@@ -287,7 +297,9 @@ class Control:
 
     def __init__(self):
         self.starter = None
-        self.desk = None
+        self.desk = None  # the latest run's desk
+        self.desks = {}  # every run's started here, by marker, the oldest first (ended ones kept for `frames`)
+        self.desks_lock = threading.Lock()
         token = secrets.token_urlsafe(24)
         control = self
 
@@ -340,15 +352,42 @@ class Control:
         if refused:
             return text_result(refused, error=True)
         self.desk = desk
-        return desk.start_answer()
+        answer = desk.start_answer()
+        if desk.marker:
+            with self.desks_lock:
+                self.desks[desk.marker] = desk
+                ended = [m for m, d in self.desks.items() if d.ended is not None]
+                for marker in ended[:max(0, len(ended) - KEPT_ENDED)]:  # (the oldest ended ones go)
+                    self.desks.pop(marker, None)
+        return answer
+
+    def desk_for(self, run):
+        """(the desk a call is for, None) or (None, why not): the run it names, else the only run going (the latest
+        run's when none is going: `frames` after it ended)."""
+        with self.desks_lock:
+            if run:
+                desk = self.desks.get(run)
+                if desk is None and self.desk is not None and self.desk.marker == run:
+                    desk = self.desk
+                if desk is None:  # ("going": autopilot/mcp.py asks another agent service running then)
+                    why = (f"Run {run} isn't going any more (the agent service restarted): call start_run to start one."
+                           if self.desks or self.desk is not None else "No run is going: call start_run first.")
+                    return None, {**text_result(why, error=True), "going": False}
+                return desk, None
+            going = [d for d in self.desks.values() if d.ended is None]
+        if len(going) > 1:
+            return None, text_result(f"{len(going)} runs are going ({', '.join(d.marker for d in going)}): pass "
+                                     "run=\"<its id>\" with the call (the id start_run answered with).", error=True)
+        if going:
+            return going[0], None
+        if self.desk is None:  # ("going": as "connected" above)
+            return None, {**text_result("No run is going: call start_run first.", error=True), "going": False}
+        return self.desk, None
 
     def call(self, tool, body):
-        desk = self.desk
-        if desk is None:  # ("going": as "connected" above)
-            return {**text_result("No run is going: call start_run first.", error=True), "going": False}
-        if body.get("run") and body.get("run") != desk.marker:
-            return text_result("That run isn't going any more (the agent service restarted, or another run "
-                               "started): call start_run to start one.", error=True)
+        desk, refused = self.desk_for(body.get("run"))
+        if desk is None:
+            return refused
         return desk.call(tool, body.get("args") or {})
 
     def close(self):
@@ -356,10 +395,11 @@ class Control:
         self.httpd.server_close()
 
 
-def instructions_text(engine, run_rel):
+def instructions_text(engine, run_rel, marker=""):
     from .. import vision
 
     return (system_prompt(engine, run_rel) + "\n" + EXTERNAL_TOOLS.replace("{run}", run_rel)
+            .replace("{marker}", marker or "<this run's id>")
             .replace("{max_frames}", str(vision.MAX_FRAMES))
             .replace("{describer}", " ".join(line.strip() for line in vision.SYSTEM.splitlines()
                                              if line.strip()))
@@ -402,7 +442,7 @@ def implement(game, project, prompt, run_id=None, say=None, client=None, model=N
     try:
         game.pause(True)  # (in the try: a game that doesn't answer still gets cleaned up and reported)
         with open(os.path.join(session.run_dir, INSTRUCTIONS), "w", encoding="utf-8", newline="\n") as f:
-            f.write(instructions_text(engines.of(game), session.run_rel))
+            f.write(instructions_text(engines.of(game), session.run_rel, desk.marker))
         message = first_message(session)
         with open(os.path.join(session.run_dir, REQUEST), "w", encoding="utf-8", newline="\n") as f:
             f.write(message)

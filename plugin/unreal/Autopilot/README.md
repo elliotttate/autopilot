@@ -402,7 +402,16 @@ movement, view, on-screen texts and UI are its own. A player the agent doesn't d
 drives the others when the prompt is about players together (co-op, handing things over, one player seeing another) or
 when the game needs every player to go on. Play In Editor plays as you set it up: the agent never changes the number of
 players or the net mode. Pointing the mouse at a place is player 1's only for now (another player's UI is clicked
-through its widgets directly), and the recording and the bug detectors follow player 1's world.
+through its widgets directly), and the bug detectors follow player 1's world; each player is recorded apart.
+
+**Several runs at once: games side by side.** Your own Claude Code or Codex (through `autopilot mcp`) can keep up to
+three runs going at once when it works through several requests (a list or a spreadsheet of prompts): its first run
+asks for that many, and the editor then plays that many games side by side, each in a window of its own, one run in
+each. They are Play In Editor started as standalone games run under one process, with a copy of your Play settings
+(yours stay as they are), so each game is a game of its own: each run restarts, pauses and records only its own, and
+its game looks to it like a game of one player. The Autopilot tab shows the first game's run; the other runs' results
+go back to the agent that started them. Every game renders, so the editor works harder: three at once suits a strong
+graphics card. `AUTOPILOT_MAX_PARALLEL` (in autopilot.env) lowers or raises the most at once.
 
 **While a run plays, the game gets the agent's input alone.** Your own keyboard, mouse and gamepads don't reach the
 game: a key or stick while the game has focus, or the mouse over the game's view, is held off before anything else in

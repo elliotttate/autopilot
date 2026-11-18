@@ -9,6 +9,10 @@ It is a front for the agent service the editor's plugin started: it finds it by 
 connected. A call that takes longer than WAIT_SECONDS (an episode, the game starting: a client gives up on a slow
 call, Codex after 60 s) answers "still going", and `wait` gives its result.
 
+Several runs may go at once, each in a game of its own (Unreal's editor plays them side by side: start_run's
+`parallel`): start_run answers with the run's id, and every other call names its run (`run`). A client whose subagents
+share this server (Claude Code's) works on several runs through it; a call that names no run is the only run's.
+
 A program that runs an agent service of its own and sets this server up for its own agent says which service to use:
 AUTOPILOT_MCP_BRAIN names a brain file (what that service announced: its "control" address), and then no other service
 on the machine is looked for. It may also say where the runs its agent starts were asked for: AUTOPILOT_MCP_TRACE, a
@@ -48,17 +52,23 @@ START_SPEC = (
     "that looks wrong\"). minutes: an exploration's minutes of play (default 10). "
     "time_limit_minutes: the run's time limit (default 30). level: the level to play, when you know its path or "
     "name (default: the one open in the editor; the briefing lists the project's levels, and restart_level moves to "
-    "the one the request means). Answers with the briefing and the instructions to follow; "
-    "the game is paused between calls.",
+    "the one the request means). parallel: when you work through several requests, how many runs you keep going at "
+    "once (default 1; up to 3, as the agent service allows): the first start_run of a batch says it, and the editor "
+    "then plays that many games side by side (a window each), one per run; a start_run while that many go is refused "
+    "until one reports. Answers with the run's id (pass it as run with every other call), the briefing and the "
+    "instructions to follow; the game is paused between calls.",
     {"type": "object", "properties": {
         "request": {"type": "string"}, "kind": {"type": "string", "enum": ["verify", "goal", "explore"]},
-        "minutes": {"type": "number"}, "time_limit_minutes": {"type": "number"}, "level": {"type": "string"}},
+        "minutes": {"type": "number"}, "time_limit_minutes": {"type": "number"}, "level": {"type": "string"},
+        "parallel": {"type": "integer", "minimum": 1}},
      "required": ["request", "kind"]})
 WAIT_SPEC = (
     "wait",
     "Wait for the call still going (an episode, the game starting) and give its result. If it is still going after "
     f"about {WAIT_SECONDS:.0f} s, it says so: call wait again.",
     {"type": "object", "properties": {}})
+RUN_PROPERTY = {"type": "string",
+                "description": "the run's id, as start_run answered it (needed while several runs go)"}
 DESCRIBE_HERE = ("Fallback only (use your describer subagent and `frames`, as INSTRUCTIONS.md says): Autopilot's own "
                  "vision model describes an episode's frames; it works only where the user has a key or Aura for "
                  "one. ")
@@ -77,9 +87,14 @@ def tools():
     for name, description, schema in TOOL_SPECS:
         specs.append((name, DESCRIBE_HERE + description if name == "describe_frames" else description, schema))
     specs += [FRAMES_SPEC, *FILE_TOOL_SPECS]
-    return [{"name": n, "description": d, "inputSchema": s,
+    return [{"name": n, "description": d, "inputSchema": s if n == "start_run" else with_run(s),
              "annotations": {"readOnlyHint": n in READ_ONLY, "destructiveHint": False, "openWorldHint": False}}
             for n, d, s in specs]
+
+
+def with_run(schema):
+    """A tool's schema with `run`, the run the call is for."""
+    return {**schema, "properties": {**(schema.get("properties") or {}), "run": RUN_PROPERTY}}
 
 
 def client_name(info):
@@ -158,9 +173,12 @@ class Server:
         self.send_lock = threading.Lock()
         self.lock = threading.Lock()
         self.client = None
-        self.control = None  # the address the run going was started at
+        self.control = None  # the address the latest run was started at
         self.run = None  # its marker
-        self.pending = None  # (thread, box, tool, started) of a call still going
+        self.runs = {}  # every run started here: its marker -> the address it was started at
+        self.starts = 0  # start_run calls so far (one still going waits as "start-<n>")
+        self.pending = {}  # the calls still going, by the run they are for ("": one that named none): (thread, box,
+        # tool, started)
 
     def send(self, message):
         with self.send_lock:
@@ -205,12 +223,22 @@ class Server:
                 self.control = url
                 first = next((c.get("text", "") for c in answer.get("content") or [] if c.get("type") == "text"), "")
                 self.run = first.split()[2] if first.startswith("Autopilot run ") else None
+                if self.run:
+                    self.runs[self.run] = url
             return plain(answer)
-        body = {"run": self.run, "args": args or {}}
-        if self.control is not None:
-            return plain(self.post(f"{self.control}/call/{name}", body))
-        # (a front that started no run works on the run going: Codex starts one of these for each of its subagents,
-        # the frames' describer among them; the agent service runs one at a time)
+        args = dict(args or {})
+        run = str(args.pop("run", "") or "").strip() or None
+        # (no run named: the one run started here, else the agent service's only run going; several started here, the
+        # service decides, and refuses while several go)
+        run = run or (self.run if len(self.runs) <= 1 else None)
+        body = {"run": run, "args": args}
+        control = self.runs.get(run) if run else (self.control if len(self.runs) <= 1 else None)
+        if control is None and run is None and self.runs:
+            control = self.control
+        if control is not None:
+            return plain(self.post(f"{control}/call/{name}", body))
+        # (a front that started no run works on the run named, or the run going: Codex starts one of these for each of
+        # its subagents, the frames' describer among them)
         return plain(self.first_taker(f"call/{name}", body, "going")[1])
 
     def call(self, name, args):
@@ -222,26 +250,37 @@ class Server:
             return text(refused, error=True)
         if name in FILE_TOOLS:
             return self.forward(name, args)
+        key = str((args or {}).get("run") or "").strip()  # (each run's calls wait apart)
         with self.lock:
-            pending = self.pending
             if name == "wait":
+                if not key and len(self.pending) > 1:
+                    return text(f"Calls of {len(self.pending)} runs are going ({', '.join(sorted(self.pending))}): "
+                                "pass run=\"<its id>\" to wait for one.", error=True)
+                if not key and self.pending:
+                    key = next(iter(self.pending))
+                pending = self.pending.get(key)
                 if pending is None:
                     return text("Nothing is going: no call is waiting for its result.")
-            elif pending is not None:
+            elif name != "start_run" and key in self.pending:
+                pending = self.pending[key]
                 return text(f"{pending[2]} is still going ({time.time() - pending[3]:.0f} s): call wait for its "
                             "result first.", error=True)
             else:
+                if name == "start_run":  # (each start waits apart: several agents may start runs at once)
+                    self.starts += 1
+                    key = f"start-{self.starts}"
                 box = {}
                 thread = threading.Thread(target=lambda: box.update(result=self.forward(name, args)), daemon=True)
                 thread.start()
-                pending = self.pending = (thread, box, name, time.time())
+                pending = self.pending[key] = (thread, box, name, time.time())
         thread, box, tool, started = pending
         thread.join(WAIT_SECONDS)
         with self.lock:
             if thread.is_alive():
-                return text(f"{tool} is still going ({time.time() - started:.0f} s): call wait for its result.")
-            if self.pending is pending:
-                self.pending = None
+                return text(f"{tool} is still going ({time.time() - started:.0f} s): call wait for its result"
+                            + (f" (run=\"{key}\")." if key else "."))
+            if self.pending.get(key) is pending:
+                self.pending.pop(key, None)
             return box.get("result") or text(f"{tool} gave no result.", error=True)
 
     def handle(self, msg):

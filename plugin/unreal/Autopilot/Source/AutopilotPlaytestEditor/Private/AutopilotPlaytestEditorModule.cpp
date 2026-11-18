@@ -126,6 +126,144 @@ namespace
 		});
 	}
 
+	/** How long N games side by side may take to start (each loads the level). */
+	double InstancesTimeout(int32 Instances)
+	{
+		return SessionTimeout + 30.0 * FMath::Max(0, Instances - 1);
+	}
+
+	/** Whether Play In Editor plays Instances games side by side, each begun play. */
+	bool InstancesReady(int32 Instances)
+	{
+		const UPlaytestSubsystem* Bridge = UPlaytestSubsystem::Get();
+		if (!GEditor || !GEditor->PlayWorld || !Bridge || !Bridge->PlaysInstances())
+		{
+			return false;
+		}
+		const TArray<UWorld*> Worlds = Bridge->GetPlayerWorlds();
+		if (Worlds.Num() < Instances)
+		{
+			return false;
+		}
+		for (const UWorld* World : Worlds)
+		{
+			if (!World || !World->HasBegunPlay())
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	void StopPie(TFunction<void(bool, const FString&)> Done);
+
+	/** How many games side by side the session being started now was asked for (0: none being started): another start
+	 *  meanwhile waits for it instead of stopping it. */
+	int32 StartingInstances = 0;
+
+	/** Play In Editor as Instances games side by side, in the level Map when given (else the one open in the editor):
+	 *  standalone, run under one process, so each is a game of its own in a window of its own, one run's (its player n).
+	 *  The session starts with a copy of the user's Play settings changed only so (their settings stay as they are);
+	 *  one playing otherwise (another number of players, networked) is stopped first. */
+	void StartInstances(int32 Instances, const FString& Map, TFunction<void(bool, const FString&)> Done)
+	{
+		FAutopilotSession::HoldExceptionBreaks();  // (as StartPie)
+		if (InstancesReady(Instances))
+		{
+			Done(true, FString());
+			return;
+		}
+		FString Package, Error;
+		if (!Map.IsEmpty() && !PlaytestLevels::Resolve(Map, Package, Error))
+		{
+			Done(PieRunning(), Error);
+			return;
+		}
+		auto Wait = [Instances, Done]()
+		{
+			const double Start = FPlatformTime::Seconds();
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Instances, Done, Start](float)
+			{
+				if (InstancesReady(Instances))
+				{
+					StartingInstances = 0;
+					Done(true, FString());
+					return false;
+				}
+				if (FPlatformTime::Seconds() - Start > InstancesTimeout(Instances))
+				{
+					StartingInstances = 0;
+					const UPlaytestSubsystem* Bridge = UPlaytestSubsystem::Get();
+					const int32 Playing = Bridge ? Bridge->GetPlayerWorlds().Num() : 0;
+					Done(PieRunning(), FString::Printf(TEXT("Timed out waiting for %d games side by side (%d playing)"), Instances, Playing));
+					return false;
+				}
+				return true;
+			}));
+		};
+		auto Request = [Instances, Package, Wait]()
+		{
+			if (!GEditor->IsPlaySessionRequestQueued() && !PieRunning())
+			{
+				ULevelEditorPlaySettings* Settings = NewObject<ULevelEditorPlaySettings>(GetTransientPackage(), NAME_None, RF_Transient,
+					const_cast<ULevelEditorPlaySettings*>(GetDefault<ULevelEditorPlaySettings>()));
+				Settings->SetPlayNetMode(PIE_Standalone);
+				Settings->bLaunchSeparateServer = false;
+				Settings->SetRunUnderOneProcess(true);
+				Settings->SetPlayNumberOfClients(Instances);
+				FIntPoint Size;
+				Settings->GetClientWindowSize(Size);
+				if (Size.X < 960 || Size.Y < 540)  // (the further games' windows: big enough for their pictures to show)
+				{
+					Settings->SetClientWindowSize(FIntPoint(960, 540));
+				}
+				Settings->AddToRoot();  // (kept until the session has started from it: the request is taken next tick)
+				FRequestPlaySessionParams Params;
+				Params.EditorPlaySettings = Settings;
+				if (!Package.IsEmpty() && Package != PlaytestLevels::EditorLevel())  // (the open one plays as it is, unsaved)
+				{
+					Params.GlobalMapOverride = PlaytestLevels::ObjectPath(Package);
+				}
+				GEditor->RequestPlaySession(Params);
+				StartingInstances = Instances;
+				TWeakObjectPtr<ULevelEditorPlaySettings> Weak(Settings);
+				FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Weak](float)
+				{
+					if (GEditor && GEditor->IsPlaySessionRequestQueued())
+					{
+						return true;
+					}
+					if (ULevelEditorPlaySettings* Kept = Weak.Get())
+					{
+						Kept->RemoveFromRoot();
+					}
+					return false;
+				}), 1.0f);
+			}
+			Wait();
+		};
+		if (StartingInstances >= Instances)
+		{
+			Wait();  // (being started already, for another run)
+			return;
+		}
+		if (PieRunning() && !GEditor->IsPlaySessionRequestQueued())
+		{
+			// (a session that isn't these games: one player, or networked, or fewer games)
+			StopPie([Request, Done](bool, const FString& StopError)
+			{
+				if (!StopError.IsEmpty())
+				{
+					Done(PieRunning(), StopError);
+					return;
+				}
+				Request();
+			});
+			return;
+		}
+		Request();
+	}
+
 	void StopPie(TFunction<void(bool, const FString&)> Done)
 	{
 		if (!PieRunning())
@@ -194,6 +332,7 @@ public:
 		if (UPlaytestSubsystem* Bridge = UPlaytestSubsystem::Get())
 		{
 			Bridge->SessionHandler = &HandleSession;
+			Bridge->InstancesHandler = &StartInstances;
 			Bridge->SessionRequested = []() { return GEditor && GEditor->IsPlaySessionRequestQueued(); };
 			// How many players Play In Editor starts in this editor: Number of Players, when run under one process (else
 			// the others are games of their own, out of the plugin's reach)
@@ -258,6 +397,7 @@ public:
 			if (UPlaytestSubsystem* Bridge = UPlaytestSubsystem::Get())
 			{
 				Bridge->SessionHandler = nullptr;
+				Bridge->InstancesHandler = nullptr;
 				Bridge->SessionRequested = nullptr;
 				Bridge->PlaySettingsPlayers = nullptr;
 			}

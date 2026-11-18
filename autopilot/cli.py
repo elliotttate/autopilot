@@ -95,6 +95,12 @@ RESET_TRIES = 5
 # session loading its level: Unreal's Analyze stage reads "Waiting for PIE"). Its reading and probing time counts
 # from the end of the wait (agents/session.py, RESEARCH_SECONDS); past this the game is read as it is
 GAME_START_SECONDS = 600.0
+# The most runs `autopilot serve` plays at once when the user's own agent asks for several (start_run's `parallel`),
+# each in a game of its own side by side in the editor (AUTOPILOT_MAX_PARALLEL changes it): each game renders in a
+# window of its own, in the editor's one process
+MAX_PARALLEL = 3
+# How long the first of them waits for the games side by side to start (each loads the level)
+LANES_START_SECONDS = 300.0
 
 
 class Feed:
@@ -161,15 +167,19 @@ class LiveLink:
 
 @contextlib.contextmanager
 def run_holds(link):
-    """For the time of a run the link is its game's: another game's plugin is refused (bridge.serve_local)."""
+    """For the time of a run the link is its game's: another game's plugin is refused (bridge.serve_local). Runs at once
+    (Lanes) hold it until the last of them ends."""
     state = getattr(link, "_state", None)
     if isinstance(state, dict):
         state["run"] = getattr(link, "hello", None) or {}
+        state["holds"] = state.get("holds", 0) + 1
     try:
         yield
     finally:
         if isinstance(state, dict):
-            state.pop("run", None)
+            state["holds"] = max(0, state.get("holds", 1) - 1)
+            if not state["holds"]:
+                state.pop("run", None)
 
 
 # -- the project on disk ------------------------------------------------------------------------------------------
@@ -1305,37 +1315,119 @@ def external_run(params):
         run["time_limit_minutes"] = params["minutes"]
     if str(params.get("level") or "").strip():
         run["level"] = str(params["level"]).strip()
+    try:  # (how many runs its agent keeps going at once: the games the editor plays side by side, cmd_serve)
+        if int(params.get("parallel") or 1) > 1:
+            run["parallel"] = int(params["parallel"])
+    except (TypeError, ValueError):
+        pass
     if isinstance(params.get("trace"), dict):  # (where the run was asked for, as its MCP server was told)
         run["trace"] = params["trace"]
     return run
 
 
+def max_parallel():
+    """The most runs `autopilot serve` plays at once (AUTOPILOT_MAX_PARALLEL, default MAX_PARALLEL), each in a game of
+    its own beside the others."""
+    try:
+        return max(1, int(os.environ.get("AUTOPILOT_MAX_PARALLEL") or MAX_PARALLEL))
+    except ValueError:
+        return MAX_PARALLEL
+
+
+def plays_side_by_side(link):
+    """Whether the plugin plays games side by side (its hello's features say "instances": Unreal's editor, as Play In
+    Editor instances), so runs can go at once."""
+    return "instances" in ((getattr(link, "hello", None) or {}).get("features") or [])
+
+
+class Lanes:
+    """The runs going in `autopilot serve`, by the game each plays (its lane: player n of the games the editor plays
+    side by side; 1 when one run plays the editor's own play session, as before). The tab's runs and the user's own
+    agent's go one at a time, unless the agent asks for several at once (start_run's `parallel`) and the plugin plays
+    games side by side: then up to `size` go at once, each through a bridge.Lane. The size is set by the first run
+    started while none goes, and holds until every run has ended (the play session has that many games)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.going = {}  # lane -> (thread, stop event, steering)
+        self.size = 1
+        self.played = set()  # the lanes whose game an earlier run played (restarted for the next: a fresh level)
+        self.setup = threading.Lock()  # (the games side by side are started once: the first lane's run starts them)
+
+    def prune(self):
+        """Forget the runs that have ended (under self.lock); whether any goes."""
+        for lane in [n for n, g in self.going.items() if not g[0].is_alive()]:
+            self.going.pop(lane, None)
+        if not self.going:
+            self.size, self.played = 1, set()
+        return bool(self.going)
+
+    def busy(self):
+        with self.lock:
+            return self.prune()
+
+    def busy_beside(self, lane):
+        with self.lock:
+            return any(n != lane and g[0].is_alive() for n, g in self.going.items())
+
+    def take(self, want):
+        """A free lane for a run (want: how many its agent keeps going at once, 1 or more), or (None, why not)."""
+        if not self.prune():
+            self.size = max(1, want)
+        if len(self.going) >= self.size:
+            if self.size == 1:
+                return None, ("A run is going in the editor: stop it there (or let it finish), then call start_run "
+                              "again.")
+            return None, (f"{self.size} runs are going, the most this play session plays at once: start this one once "
+                          "one of them has reported.")
+        return next(n for n in range(1, self.size + 1) if n not in self.going), None
+
+    def stop_all(self):
+        with self.lock:
+            for thread, stop, _ in self.going.values():
+                if thread.is_alive():
+                    stop.set()
+
+    def shown(self):
+        """The run the tab shows: lane 1's (Stop and Steer from the tab reach it), or None."""
+        with self.lock:
+            going = self.going.get(1)
+            return going if going is not None and going[0].is_alive() else None
+
+
 def cmd_serve(link, args):
     """Run what the Autopilot tab starts, one run at a time, until stopped (Ctrl+C). Frames from the plugin are read
     while a run plays: Stop ends it, Steer passes the user's words on. args.control (an agents.external.Control): runs
-    the user's own agent starts (`autopilot mcp`), one at a time with the tab's."""
+    the user's own agent starts (`autopilot mcp`), one at a time with the tab's, or several at once when it asks
+    (start_run's `parallel`) and the plugin plays games side by side (Lanes): each run plays a game of its own."""
     run = asked = link.hello.get("run")  # (a game started with a run on its command line)
     send_memory_state(link)
     account.send_state(link)
     sign_in = account.SignIn(link)  # (the plugin's requests to sign in to Aura: autopilot/account.py)
     done = []  # the command-line run's result, for a plugin that lost it and asks again (answer_again)
-    going = None  # (thread, stop event, steering) of the run going now
-    lock = threading.Lock()  # (going, as the tab's frames and the user's own agent's start calls see it)
+    lanes = Lanes()  # the runs going now
+    lock = lanes.lock  # (what goes, as the tab's frames and the user's own agent's start calls see it)
     feed = Feed()  # the latest run's activity events, for a plugin that asks for them again (hello activity_since)
     feed.watch_rebind(link)
 
-    def start(run, prompt, stop, steering, desk=None):
+    def start(run, prompt, stop, steering, desk=None, lane=None):
         nonlocal done
         sent = []
+        played = link
+        if lane is not None:  # (one of the games side by side: its own, started first)
+            played = bridge.Lane(link, lane, lanes.size, busy_beside=lambda: lanes.busy_beside(lane)).attach()
         try:
+            if lane is not None:
+                ready_lane(played, lane)
             with run_holds(link):
-                run_prompt(link, prompt, args.path, args.model, timeout=time_limit(run), sent=sent, stop=stop.is_set,
-                           steering=steering, kind=run.get("kind") if run.get("kind") in aura.KINDS else None,
+                run_prompt(played, prompt, args.path, args.model, timeout=time_limit(run), sent=sent,
+                           stop=stop.is_set, steering=steering,
+                           kind=run.get("kind") if run.get("kind") in aura.KINDS else None,
                            play_minutes=play_minutes(run), trace=run.get("trace"), desk=desk, level=run.get("level"),
                            aura_model=run.get("model"),
                            disable_premium_models=run.get("disable_premium_models") is True,
                            thinking_level=run.get("thinking_level"),
-                           feed=feed, explore_minutes=explore_minutes(run),
+                           feed=feed if lane in (None, 1) else None, explore_minutes=explore_minutes(run),
                            design_brief=str(run.get("design_brief") or "").strip() or None)
         except Exception as e:
             print(f"The run failed: {type(e).__name__}: {e}")
@@ -1347,24 +1439,45 @@ def cmd_serve(link, args):
                       "summary": f"The run failed: {e}", "evidence": []}
             sent.append({"type": "result", "result": scrub(result_frame(failed, prompt, kind))})
             try:
-                link.send(sent[-1])
+                played.send(sent[-1])
             except Exception:
                 pass
+        finally:
+            if lane is not None:
+                played.detach()
+                with lock:
+                    lanes.played.add(lane)
         if run is asked and sent:
             done = [(time.time(), run, sent[-1], link.current)]
         send_memory_state(link)  # (what the run added)
 
+    def ready_lane(played, lane):
+        """The lane's game plays, fresh: the games side by side started (by the first lane's run, once; the others
+        wait for it), and a game an earlier run played started over."""
+        with lanes.setup:
+            played.request("session", {"action": "start"}, timeout=LANES_START_SECONDS)
+        if lane in lanes.played:
+            played.request("session", {"action": "restart"}, timeout=120)
+        print(f"Lane {lane}: its game plays ({lanes.size} side by side)")
+
     def begin(run, prompt, desk=None):
-        """Start the run unless one is going; whether it started."""
-        nonlocal going
+        """Start the run in a free lane; None once it has started, else why it hasn't."""
         with lock:
-            if going is not None and going[0].is_alive():
-                return False
+            want = 1
+            if desk is not None and plays_side_by_side(link):  # (the tab's runs are one at a time)
+                want = min(max_parallel(), max(1, int(run.get("parallel") or 1)))
+            elif lanes.prune():
+                return "A run is going in the editor: stop it there (or let it finish), then start again."
+            lane, refused = lanes.take(want)
+            if refused:
+                return refused
             stop, steering = threading.Event(), Steering()
-            thread = threading.Thread(target=start, args=(run, prompt, stop, steering, desk), daemon=True)
-            going = (thread, stop, steering)
+            thread = threading.Thread(target=start, args=(run, prompt, stop, steering, desk,
+                                                          lane if lanes.size > 1 else None), daemon=True)
+            thread.desk = desk
+            lanes.going[lane] = (thread, stop, steering)
             thread.start()
-            return True
+            return None
 
     def start_external(params, desk):
         """A start call of the user's own agent (autopilot/agents/external.py): None once its run has started, else
@@ -1377,27 +1490,35 @@ def cmd_serve(link, args):
         if missing:
             return missing
         run = external_run(params)
-        if not begin(run, prompt_of(run), desk):
-            return ("A run is going in the editor: stop it there (or let it finish), then call start_run again.")
-        try:  # (the tab shows the run as one of its own: docs/protocol.md, run_started)
-            link.send({"type": "run_started", "run": dict(run, by=desk.client or "mcp")})
-        except Exception:
-            pass
+        refused = begin(run, prompt_of(run), desk)
+        if refused:
+            return refused
+        if lanes_shows(desk):  # (the tab shows the run as one of its own: docs/protocol.md, run_started)
+            try:
+                link.send({"type": "run_started", "run": dict(run, by=desk.client or "mcp")})
+            except Exception:
+                pass
         return None
+
+    def lanes_shows(desk):
+        """Whether the tab shows the run desk is for (one run at a time, or lane 1's of several)."""
+        with lock:
+            if lanes.size == 1:
+                return True
+            going = lanes.going.get(1)
+            return going is not None and getattr(going[0], "desk", None) is desk
 
     control = getattr(args, "control", None)
     if control is not None:
         control.starter = start_external
 
     while True:
-        if run and going is None:
+        if run and not lanes.busy():
             prompt = prompt_of(run)
             if prompt:
                 begin(run, prompt)
             run = None
-        with lock:
-            if going is not None and not going[0].is_alive():
-                going = None
+        lanes.busy()
         msg = link.next_message(timeout=1.0)
         if msg is None:
             continue
@@ -1407,7 +1528,7 @@ def cmd_serve(link, args):
             send_memory_state(link, msg)
             account.send_state(link)
             feed.watch_rebind(link)
-            if going is not None:  # (the run goes on through the new link: what the project muted, there too)
+            if lanes.busy():  # (the runs go on through the new link: what the project muted, there too)
                 folder = codexmod.project_dir(codexmod.project_of(link.hello))
                 detectorsmod.send(link, folder, wait=False)
                 detectorsmod.watch(link, folder)
@@ -1420,17 +1541,17 @@ def cmd_serve(link, args):
         elif account.handle(link, msg, sign_in):
             pass
         elif kind == "start":
-            if going is not None:
+            if lanes.busy():
                 link.send({"type": "status", "text": "A run is going: steer it, or stop it first"})
             else:
                 run = msg.get("run") or {}
-        elif kind == "stop" and going is not None:
-            going[1].set()
+        elif kind == "stop" and lanes.busy():
+            lanes.stop_all()  # (the tab's Stop: every run going, the games side by side too)
             link.status("Stopping")
-        elif kind == "steer" and going is not None:
+        elif kind == "steer" and lanes.shown() is not None:
             # (mode: "hint", the default, or "redirect", which ends the episode playing now; see bridge.BRAIN_FEATURES)
             mode = msg.get("mode") if msg.get("mode") in STEER_MODES else HINT
-            if going[2].add(msg.get("text"), mode):
+            if lanes.shown()[2].add(msg.get("text"), mode):
                 link.status(("Redirecting: " if mode == REDIRECT else "Hint: ") + str(msg.get("text")).strip())
         elif kind == "feedback":
             take_feedback(link, msg)
@@ -1439,7 +1560,7 @@ def cmd_serve(link, args):
             send_memory_state(link)  # (the switch shows what the file says now)
         elif kind == "clear_memory":
             with lock:  # (a start call of the user's own agent waits while the memory moves)
-                if going is not None and going[0].is_alive():
+                if lanes.prune():
                     answer = {"type": "memory_cleared", "ok": False,
                               "message": "A run is going: stop it or let it finish first."}
                 else:
