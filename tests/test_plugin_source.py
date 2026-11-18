@@ -13,8 +13,12 @@ INPUT_OPS = os.path.join(PRIVATE, "PlaytestOpsInput.cpp")  # `input`, `move`, `k
 def test_the_plugins_restart_takes_the_games_widgets_off_the_viewport_first():
     source = open(SESSION_OPS, encoding="utf-8").read()
     restart = source[source.index("restarting reopens the map the game was launched with"):]
-    restart = restart[:restart.index("Bridge.AddPending")]
-    assert restart.index("RemoveGameWidgets(World);") < restart.index("UGameplayStatics::OpenLevel(")
+    restart = restart[:restart.index("\n\t}\n")]
+    assert "ReopenLevel(Bridge, Id, 1, World, Map);" in restart
+    # (ReopenLevel: a game build's restart, and one game's of several side by side)
+    reopen = source[source.index("void ReopenLevel("):]
+    reopen = reopen[:reopen.index("Bridge.AddPending")]
+    assert reopen.index("RemoveGameWidgets(World);") < reopen.index("UGameplayStatics::OpenLevel(")
     helper = source[source.index("void RemoveGameWidgets(UWorld* World)"):]
     helper = helper[:helper.index("\n\t}\n")]
     assert "RemoveAllViewportWidgets()" in helper

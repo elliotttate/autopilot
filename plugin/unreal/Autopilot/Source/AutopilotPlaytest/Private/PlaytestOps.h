@@ -66,7 +66,7 @@ namespace PlaytestOps
 	void Levels(UPlaytestSubsystem& Bridge, int64 Id);
 	void Pause(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Args);
 	void Timestep(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Args);
-	void Ping(UPlaytestSubsystem& Bridge, int64 Id);
+	void Ping(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Args);
 	void Input(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Args);
 	void Move(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Args);
 	void KeyOp(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Args);

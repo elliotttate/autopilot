@@ -73,6 +73,7 @@ namespace
 		int64 RequestId = 0;   // a still: the request it answers
 		int64 N = 0;           // a frame: its number in the recording
 		int32 Generation = 0;  // a frame: the recording it belongs to
+		int32 Player = 1;      // whose view it is (another player's recording's frames say so)
 		int32 Serial = 0;      // the connection it was asked on
 		double T = 0.0;        // the game time it shows
 		double Wall = 0.0;     // Unix seconds, when it was asked for
@@ -255,8 +256,10 @@ namespace
 		}
 		else
 		{
-			Text += FString::Printf(TEXT("{\"type\":\"frame\",\"n\":%lld,\"t\":%s,\"wall\":%s,\"width\":%d,\"height\":%d,\"jpeg\":\""),
-				(long long)Job->N, *Seconds(Job->T), *Seconds(Job->Wall), Sent.X, Sent.Y);
+			// (another player's recording: its frames say whose they are; player 1's say nothing, as before)
+			const FString Player = Job->Player != 1 ? FString::Printf(TEXT(",\"player\":%d"), Job->Player) : FString();
+			Text += FString::Printf(TEXT("{\"type\":\"frame\",\"n\":%lld,\"t\":%s,\"wall\":%s,\"width\":%d,\"height\":%d%s,\"jpeg\":\""),
+				(long long)Job->N, *Seconds(Job->T), *Seconds(Job->Wall), Sent.X, Sent.Y, *Player);
 			Text += Base64;
 			Text += TEXT("\"}");
 		}
@@ -460,7 +463,7 @@ private:
 struct FPlaytestMedia::FJobs
 {
 	TArray<FMediaJobPtr> InFlight;
-	FMediaJobPtr Frame;  // the recording's frame in flight
+	TMap<int32, FMediaJobPtr> Frames;  // each recording's frame in flight, by player
 };
 
 FPlaytestMedia::FPlaytestMedia(UPlaytestSubsystem& InBridge)
@@ -498,9 +501,9 @@ void FPlaytestMedia::Shutdown()
 	if (Jobs.IsValid())
 	{
 		Jobs->InFlight.Reset();
-		Jobs->Frame.Reset();
+		Jobs->Frames.Reset();
 	}
-	bRecording = false;
+	Recordings.Reset();
 }
 
 bool FPlaytestMedia::Hook()
@@ -568,7 +571,7 @@ FString FPlaytestMedia::FindPicture(UWorld* World, FIntRect& OutRect, const SWin
 	return FString();
 }
 
-bool FPlaytestMedia::Start(UWorld* World, bool bStill, int64 Number, int32 MaxDim, int32 Quality, FString& OutError)
+bool FPlaytestMedia::Start(UWorld* World, int32 Player, bool bStill, int64 Number, int32 MaxDim, int32 Quality, FString& OutError)
 {
 	FIntRect Rect;
 	const SWindow* Window = nullptr;
@@ -580,9 +583,11 @@ bool FPlaytestMedia::Start(UWorld* World, bool bStill, int64 Number, int32 MaxDi
 	FMediaJobPtr Job = MakeShared<FMediaJob, ESPMode::ThreadSafe>();
 	Job->bStill = bStill;
 	(bStill ? Job->RequestId : Job->N) = Number;
-	Job->Generation = Generation;
+	const FRecording* Recording = Recordings.Find(Player);
+	Job->Generation = Recording ? Recording->Generation : 0;
+	Job->Player = Player;
 	Job->Serial = Bridge.GetConnectionSerial();
-	Job->T = FMath::Max(0.0, Bridge.GameTime());
+	Job->T = FMath::Max(0.0, World->GetTimeSeconds());  // (the clock of the world it shows: each game has its own)
 	Job->Wall = UnixNow();
 	Job->MaxDim = MaxDim;
 	Job->Quality = Quality;
@@ -592,7 +597,7 @@ bool FPlaytestMedia::Start(UWorld* World, bool bStill, int64 Number, int32 MaxDi
 	Jobs->InFlight.Add(Job);
 	if (!bStill)
 	{
-		Jobs->Frame = Job;
+		Jobs->Frames.Add(Player, Job);
 	}
 	Render->Add(Job);
 	return true;
@@ -602,12 +607,18 @@ void FPlaytestMedia::Record(int64 Id, const TSharedPtr<FJsonObject>& Args)
 {
 	FString Action;
 	Args->TryGetStringField(TEXT("action"), Action);
+	// The request's player's view ("player" n), player 1's when it says none: each player is recorded apart (the games
+	// an editor plays side by side are each a run's), and another player's frames say whose they are
+	double PlayerArg = 1.0;
+	Args->TryGetNumberField(TEXT("player"), PlayerArg);
+	const int32 Player = FMath::Max(1, FMath::FloorToInt32(PlayerArg));
 	if (Action == TEXT("stop"))
 	{
 		TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
 		Result->SetBoolField(TEXT("recording"), false);
-		Result->SetNumberField(TEXT("frames"), (double)FramesSent);
-		StopRecording();
+		const FRecording* Recording = Recordings.Find(Player);
+		Result->SetNumberField(TEXT("frames"), Recording ? (double)Recording->FramesSent : 0.0);
+		StopRecording(Player);
 		Bridge.Respond(Id, MakeShared<FJsonValueObject>(Result));
 		return;
 	}
@@ -622,39 +633,37 @@ void FPlaytestMedia::Record(int64 Id, const TSharedPtr<FJsonObject>& Args)
 	Args->TryGetNumberField(TEXT("quality"), QualityArg);
 	FIntRect Rect;
 	const SWindow* Window = nullptr;
-	const FString Problem = FindPicture(Bridge.GetGameWorld(), Rect, Window);  // (a recording is player 1's view)
+	const FString Problem = FindPicture(Bridge.GetPlayerWorld(Player), Rect, Window);
 	if (!Problem.IsEmpty())
 	{
 		Bridge.RespondError(Id, Problem, 409);
 		return;
 	}
-	StopRecording();  // (a start while recording starts again: frame numbers from 0)
-	bRecording = true;
-	Interval = 1.0 / FMath::Clamp(Fps, 0.1, 30.0);
-	RecordMaxDim = FMath::Clamp((int32)MaxDimArg, 16, 8192);
-	RecordQuality = FMath::Clamp((int32)QualityArg, 1, 100);
-	NextFrame = 0.0;
-	NextN = 0;
-	FramesSent = 0;
-	RecordSerial = Bridge.GetConnectionSerial();
-	const FIntPoint Sent = SentSize(Rect.Size(), RecordMaxDim);
+	StopRecording(Player);  // (a start while recording starts again: frame numbers from 0)
+	FRecording& Recording = Recordings.Add(Player);
+	Recording.Generation = ++Generation;
+	Recording.Interval = 1.0 / FMath::Clamp(Fps, 0.1, 30.0);
+	Recording.MaxDim = FMath::Clamp((int32)MaxDimArg, 16, 8192);
+	Recording.Quality = FMath::Clamp((int32)QualityArg, 1, 100);
+	Recording.Serial = Bridge.GetConnectionSerial();
+	const FIntPoint Sent = SentSize(Rect.Size(), Recording.MaxDim);
 	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("recording"), true);
 	Result->SetNumberField(TEXT("width"), Sent.X);
 	Result->SetNumberField(TEXT("height"), Sent.Y);
 	Bridge.Respond(Id, MakeShared<FJsonValueObject>(Result));
-	UE_LOG(LogPlaytest, Display, TEXT("[Autopilot] Recording the game: %.1f frames a second, %dx%d"), 1.0 / Interval, Sent.X, Sent.Y);
+	UE_LOG(LogPlaytest, Display, TEXT("[Autopilot] Recording the game (player %d): %.1f frames a second, %dx%d"), Player,
+		1.0 / Recording.Interval, Sent.X, Sent.Y);
 }
 
-void FPlaytestMedia::StopRecording()
+void FPlaytestMedia::StopRecording(int32 Player)
 {
-	if (bRecording)
+	if (const FRecording* Recording = Recordings.Find(Player))
 	{
-		UE_LOG(LogPlaytest, Display, TEXT("[Autopilot] Recording stopped: %lld frames sent"), (long long)FramesSent);
+		UE_LOG(LogPlaytest, Display, TEXT("[Autopilot] Recording stopped (player %d): %lld frames sent"), Player, (long long)Recording->FramesSent);
+		Recordings.Remove(Player);  // (its frames still in flight are dropped: they are of no recording now)
 	}
-	bRecording = false;
-	++Generation;  // (frames still in flight are dropped)
-	Jobs->Frame.Reset();
+	Jobs->Frames.Remove(Player);
 }
 
 void FPlaytestMedia::Capture(int64 Id, const TSharedPtr<FJsonObject>& Args)
@@ -663,10 +672,11 @@ void FPlaytestMedia::Capture(int64 Id, const TSharedPtr<FJsonObject>& Args)
 	Args->TryGetNumberField(TEXT("max_dim"), MaxDimArg);
 	Args->TryGetNumberField(TEXT("quality"), QualityArg);
 	// A still of the request's player's view ("player" n: the kit's game.player(n)), player 1's when it says none
-	double Player = 1.0;
-	Args->TryGetNumberField(TEXT("player"), Player);
+	double PlayerArg = 1.0;
+	Args->TryGetNumberField(TEXT("player"), PlayerArg);
+	const int32 Player = FMath::Max(1, FMath::FloorToInt32(PlayerArg));
 	FString Problem;
-	if (!Start(Bridge.GetPlayerWorld(FMath::FloorToInt32(Player)), true, Id, FMath::Clamp((int32)MaxDimArg, 16, 8192), FMath::Clamp((int32)QualityArg, 1, 100), Problem))
+	if (!Start(Bridge.GetPlayerWorld(Player), Player, true, Id, FMath::Clamp((int32)MaxDimArg, 16, 8192), FMath::Clamp((int32)QualityArg, 1, 100), Problem))
 	{
 		Bridge.RespondError(Id, Problem, 409);
 	}
@@ -676,9 +686,17 @@ void FPlaytestMedia::Capture(int64 Id, const TSharedPtr<FJsonObject>& Args)
 void FPlaytestMedia::Tick()
 {
 	const bool bConnected = Bridge.IsConnected();
-	if (bRecording && (!bConnected || Bridge.GetConnectionSerial() != RecordSerial))
+	TArray<int32> Ended;
+	for (const TPair<int32, FRecording>& Recording : Recordings)
 	{
-		StopRecording();  // (a recording never outlives its connection)
+		if (!bConnected || Bridge.GetConnectionSerial() != Recording.Value.Serial)
+		{
+			Ended.Add(Recording.Key);  // (a recording never outlives its connection)
+		}
+	}
+	for (const int32 Player : Ended)
+	{
+		StopRecording(Player);
 	}
 	const double Now = FPlatformTime::Seconds();
 
@@ -710,7 +728,7 @@ void FPlaytestMedia::Tick()
 			}
 			if (State == (int32)EJobState::Done)
 			{
-				const double GameNow = Bridge.GameTime();
+				const double GameNow = Bridge.GameTime(Job->Player);  // (now, in the world it shows)
 				Bridge.SendRaw(Job->Text + TEXT(",\"t\":") + (GameNow < 0 ? FString(TEXT("null")) : PlaytestJson::Write(PlaytestJson::Number(GameNow))) + TEXT("}"));
 			}
 			else
@@ -719,14 +737,16 @@ void FPlaytestMedia::Tick()
 			}
 			continue;
 		}
-		if (Jobs->Frame == Job)
+		const FMediaJobPtr* Current = Jobs->Frames.Find(Job->Player);
+		if (Current && *Current == Job)
 		{
-			Jobs->Frame.Reset();
+			Jobs->Frames.Remove(Job->Player);
 		}
-		if (State == (int32)EJobState::Done && bRecording && bSameConnection && Job->Generation == Generation)
+		const FRecording* Recording = Recordings.Find(Job->Player);
+		if (State == (int32)EJobState::Done && Recording && bSameConnection && Job->Generation == Recording->Generation)
 		{
 			Bridge.SendRaw(Job->Text);
-			++FramesSent;
+			++Recordings[Job->Player].FramesSent;
 		}
 		else if (State == (int32)EJobState::Failed)
 		{
@@ -734,35 +754,37 @@ void FPlaytestMedia::Tick()
 		}
 	}
 
-	// The recording's next frame: only while the game runs and isn't paused (a paused game's picture doesn't change)
-	if (!bRecording)
+	// Each recording's next frame: only while its player's game runs and isn't paused (a paused game's picture doesn't
+	// change)
+	for (TPair<int32, FRecording>& Pair : Recordings)
 	{
-		return;
+		const int32 Player = Pair.Key;
+		FRecording& Recording = Pair.Value;
+		UWorld* World = Bridge.GetPlayerWorld(Player);
+		if (!World || World->IsPaused())
+		{
+			Recording.NextFrame = 0.0;  // (on again: a frame at once, without a gap in the numbers)
+			continue;
+		}
+		if (Recording.NextFrame <= 0.0)
+		{
+			Recording.NextFrame = Now;
+		}
+		if (Now < Recording.NextFrame)
+		{
+			continue;
+		}
+		Recording.NextFrame += Recording.Interval;
+		if (Recording.NextFrame <= Now)
+		{
+			Recording.NextFrame = Now + Recording.Interval;  // (fell behind: no burst to catch up)
+		}
+		const int64 N = Recording.NextN++;
+		if (Jobs->Frames.Contains(Player))
+		{
+			continue;  // the one before is still being read or encoded: this one is skipped (a gap in n)
+		}
+		FString Problem;
+		Start(World, Player, false, N, Recording.MaxDim, Recording.Quality, Problem);  // (no picture now: skipped)
 	}
-	UWorld* World = Bridge.GetGameWorld();
-	if (!World || World->IsPaused())
-	{
-		NextFrame = 0.0;  // (on again: a frame at once, without a gap in the numbers)
-		return;
-	}
-	if (NextFrame <= 0.0)
-	{
-		NextFrame = Now;
-	}
-	if (Now < NextFrame)
-	{
-		return;
-	}
-	NextFrame += Interval;
-	if (NextFrame <= Now)
-	{
-		NextFrame = Now + Interval;  // (fell behind: no burst to catch up)
-	}
-	const int64 N = NextN++;
-	if (Jobs->Frame.IsValid())
-	{
-		return;  // the one before is still being read or encoded: this one is skipped (a gap in n)
-	}
-	FString Problem;
-	Start(World, false, N, RecordMaxDim, RecordQuality, Problem);  // (no picture now: skipped)
 }

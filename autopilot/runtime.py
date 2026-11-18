@@ -185,13 +185,22 @@ class Running:
 
 
 STILL_GAP = 2.0  # seconds between two stills of findings, at least
+FROZEN_CM = 100.0  # play on through stalls: a player who moved less than this and sent no input is frozen
 
 
 class Runtime:
     def __init__(self, game, harness, trace_path, client=None, max_seconds=120.0, say=None, stop=None, resume=None,
-                 telemetry=None, progress=None, looker=None):
+                 telemetry=None, progress=None, looker=None, stall_ends=True):
         self.game, self.h = game, harness
         self.trace = Trace(trace_path)
+        # A stall ends the episode so the agent revises the plan (stall_ends). A replay (autopilot/regress.py) has no
+        # agent to revise anything: it plays on through a stall, noted in the trace ("stall_passed") and in the
+        # result ("stalls_passed"), and ends early only when the player is frozen: it moved less than FROZEN_CM and
+        # the harness sent no input since the stall watch began
+        self.stall_ends = stall_ends
+        self.stalls_passed = []
+        self.inputs = 0  # inputs the harness sent (its game.log("input", ...)), and their count when the watch began
+        self.inputs_at = 0
         # Looking while playing (autopilot/watch.py): a model sees the last seconds of frames now and then and after
         # a death, a failed option or a stall, and answers the harness's and the default questions; the deaths are
         # reviewed at the end. looker: a watch.Looker (or the sandbox's RemoteLooker); None: no looks
@@ -212,7 +221,7 @@ class Runtime:
         self.stills_at = {}  # finding signature -> wall time of its still
         self.last_still = 0.0
         self.log_before = game.log  # given back when the episode ends (probes after it log there)
-        self.game.log = self.trace
+        self.game.log = self.log
         self.client = client
         self.max_seconds = max_seconds
         self.say = say or (lambda text: None)  # progress in words (the Autopilot tab's status line)
@@ -600,12 +609,25 @@ class Runtime:
             self.trace("plan_mismatch", t=self.game.t, step=step.name, listed=mismatch, legal=[o.name for o in opts])
         return offered
 
+    def log(self, *kind, **fields):
+        """The harness's and the kit's game.log: into the trace, its inputs counted (for the frozen check)."""
+        if (kind[:1] == ("input",)) or (not kind and fields.get("kind") == "input"):
+            self.inputs += 1
+        return self.trace(*kind, **fields)
+
     def progressed(self, obs):
         """Progress (a step achieved, an option that worked): the stall watch starts over from now and from where
         the player stands."""
         self.progress_t = self.game.t
         self.stall_at = pose_at(obs)
         self.stall_tried = defaultdict(Counter)
+        self.inputs_at = self.inputs
+
+    def frozen(self, info):
+        """Whether a stall is a frozen player: it moved less than FROZEN_CM (or where it stands isn't known) and the
+        harness sent no input since the stall watch began."""
+        moved = (info.get("player") or {}).get("moved")
+        return (moved is None or moved < FROZEN_CM) and self.inputs == self.inputs_at
 
     def stall_info(self, obs):
         """The stall the episode ends on: the step it stood at, since when, what each option did meanwhile, and where
@@ -769,7 +791,7 @@ class Runtime:
                         continue
                     seen = None
                     if self.progress_t is None:  # (the first observation: the stall watch starts here)
-                        self.progress_t, self.stall_at = g.t, pose_at(obs)
+                        self.progress_t, self.stall_at, self.inputs_at = g.t, pose_at(obs), self.inputs
                     self.plan_update(obs)
                     opts = self.plan_offer(opts)
                     names = [o.name for o in opts]
@@ -808,6 +830,16 @@ class Runtime:
                         self.stalled.update(kind="step", seconds=round(g.t - self.step_since, 1),
                                             since_t=round(self.step_since, 2),
                                             tried={k: v for k, v in tried.items() if v})
+                    if not self.stall_ends and not self.frozen(self.stalled):
+                        # A replay plays on: the stall noted, the watch (and the step's clock) started over
+                        passed = {**self.stalled, "t": round(g.t, 2)}
+                        self.stalls_passed.append(passed)
+                        self.trace("stall_passed", **{("cause" if k == "kind" else k): v for k, v in passed.items()})
+                        self.stalled = None
+                        self.progressed(obs)
+                        if step_long:
+                            self.step_since = g.t
+                        continue
                     self.trace("stalled", t=g.t,
                                **{("cause" if k == "kind" else k): v for k, v in self.stalled.items()})
                     if self.watcher is not None:
@@ -942,6 +974,8 @@ class Runtime:
             "writes": self.game.writes,
             "last_facts": jsonable(self.h.facts(obs)) if obs is not None else None,
         }
+        if not self.stall_ends:
+            result["stalls_passed"] = jsonable(self.stalls_passed)
         # Where the plan stands, for the next episode to go on from (Harness.resume; the session fills "episode")
         step = self.current_step()
         result["progress"] = {"episode": None, "done": list(self.plan_done), "step": step.name if step else None,

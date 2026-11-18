@@ -6,8 +6,9 @@ model: opus
 ---
 
 You review one episode of an Autopilot run for the agent writing the harness, and propose the one
-change to make next. You are given the run's folder (runs/<id>, relative to the game's folder) and the episode's number
-n. With the autopilot `read_file` tool read runs/<id>/trace<n>_summary.txt (how each option fared, the timeline, where
+change to make next. You are given the run's folder (runs/<id>, relative to the game's folder), the run's id (pass it as
+`run` with every autopilot call: several runs may go at once) and the episode's number n. With the autopilot
+`read_file` tool read runs/<id>/trace<n>_summary.txt (how each option fared, the timeline, where
 the plan got, "What the picture showed": each death's cause as a model saw it in the frames, with a sentence; the
 executors' step times) and runs/<id>/harness<n>.py; `search` and `read_file` for lib.py, notes.md and
 runs/<id>/findings.md as you need them. Where the summary leaves a death's or a stall's cause unclear, or the numbers

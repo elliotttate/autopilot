@@ -311,10 +311,49 @@ namespace
 		Bridge.Respond(Id, Obj(Out));
 	}
 
+namespace
+{
+	/** Opens Map in player Player's world (World: its world now), with what the game put on the viewport taken off first
+	 *  (RemoveGameWidgets), and answers once that player's new world has begun play: a game build's restart, and the
+	 *  restart of one of the games an editor plays side by side (the others play on). */
+	void ReopenLevel(UPlaytestSubsystem& Bridge, int64 Id, int32 Player, UWorld* World, const FString& Map)
+	{
+		TWeakObjectPtr<UWorld> Old(World);
+		RemoveGameWidgets(World);
+		UGameplayStatics::OpenLevel(World, FName(*Map));
+		FPending Pending;
+		Pending.Id = Id;
+		Pending.Op = TEXT("session");
+		Pending.StartReal = FPlatformTime::Seconds();
+		Pending.Tick = [&Bridge, Old, Player](FPending& P, double Now)
+		{
+			UWorld* Current = Bridge.GetPlayerWorld(Player);
+			if (Current && Current != Old.Get() && Current->HasBegunPlay())
+			{
+				Bridge.Respond(P.Id, Running(true, Current));
+				return true;
+			}
+			if (Now - P.StartReal > 60.0)
+			{
+				Bridge.RespondError(P.Id, TEXT("Timed out reopening the map"), 500);
+				return true;
+			}
+			return false;
+		};
+		Bridge.AddPending(MoveTemp(Pending));
+	}
+}
+
 	void Session(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Args)
 	{
 		const FString Action = StringField(Args, TEXT("action"));
-		UWorld* World = Bridge.GetGameWorld();
+		// Games side by side (a session started with "instances": standalone Play In Editor instances, each a run's): a
+		// request that names its player ("player" n) is about that game alone; one that names none, about the session
+		double PlayerArg = 0.0;
+		const bool bNamesPlayer = Args.IsValid() && Args->TryGetNumberField(TEXT("player"), PlayerArg);
+		const int32 Player = FMath::Max(1, FMath::FloorToInt32(PlayerArg));
+		const bool bOwnGame = bNamesPlayer && Bridge.PlaysInstances();
+		UWorld* World = bOwnGame ? Bridge.GetPlayerWorld(Player) : Bridge.GetGameWorld();
 		if (Action == TEXT("status") || Action.IsEmpty())
 		{
 			// loading: the play session is still starting (asked for, or its world not playing yet): the agent service
@@ -323,6 +362,10 @@ namespace
 			Status->SetBoolField(TEXT("running"), World != nullptr);
 			Status->SetBoolField(TEXT("loading"), (World && !World->HasBegunPlay())
 				|| (Bridge.SessionRequested && Bridge.SessionRequested()));
+			if (Bridge.PlaysInstances())
+			{
+				Status->SetNumberField(TEXT("instances"), Bridge.GetPlayerWorlds().Num());
+			}
 			Bridge.Respond(Id, Obj(Status));
 			return;
 		}
@@ -332,6 +375,57 @@ namespace
 		if (!Map.IsEmpty() && (Action == TEXT("start") || Action == TEXT("restart")) && !PlaytestLevels::Resolve(Map, Package, Error))
 		{
 			Bridge.RespondError(Id, Error, 404);
+			return;
+		}
+		// Games side by side ("instances" N, from N >= 2): Play In Editor started as N standalone games (a window each)
+		// unless they play already; then a start or restart naming its player is that game's alone (below)
+		double InstancesArg = 0.0;
+		const int32 Instances = Args.IsValid() && Args->TryGetNumberField(TEXT("instances"), InstancesArg)
+			? FMath::FloorToInt32(InstancesArg) : 0;
+		if ((Action == TEXT("start") || Action == TEXT("restart")) && Instances >= 2)
+		{
+			if (!Bridge.InstancesHandler)
+			{
+				Bridge.RespondError(Id, TEXT("Only the editor plays games side by side (Play In Editor instances)"), 400);
+				return;
+			}
+			if (!Bridge.PlaysInstances() || Bridge.GetPlayerWorlds().Num() < Instances)
+			{
+				TWeakObjectPtr<UPlaytestSubsystem> Weak(&Bridge);
+				Bridge.InstancesHandler(Instances, Map, [Weak, Id, Player](bool bRunning, const FString& Error)
+				{
+					if (UPlaytestSubsystem* B = Weak.Get())
+					{
+						if (Error.IsEmpty())
+						{
+							B->Respond(Id, Running(bRunning, B->GetPlayerWorld(Player)));
+						}
+						else
+						{
+							B->RespondError(Id, Error, 500);
+						}
+					}
+				});
+				return;
+			}
+		}
+		if (bOwnGame && (Action == TEXT("start") || Action == TEXT("restart")))
+		{
+			if (!World)
+			{
+				Bridge.RespondError(Id, FString::Printf(TEXT("No game %d is playing"), Player), 404);
+				return;
+			}
+			// Its level reopened (a restart, or a start asking for another level): the other games play on
+			const FString Playing = PlaytestLevels::PackageOf(World);
+			if (Action == TEXT("restart") || (!Package.IsEmpty() && Package != Playing))
+			{
+				ReopenLevel(Bridge, Id, Player, World, Package.IsEmpty() ? Playing : Package);
+			}
+			else
+			{
+				Bridge.Respond(Id, Running(true, World));
+			}
 			return;
 		}
 		// A start asking for another level than the one playing goes there, as a restart in it
@@ -397,34 +491,13 @@ namespace
 		{
 			Map = UGameplayStatics::GetCurrentLevelName(World, true);  // (no world seen to begin play yet)
 		}
-		TWeakObjectPtr<UWorld> Old(World);
-		RemoveGameWidgets(World);
-		UGameplayStatics::OpenLevel(World, FName(*Map));
-		FPending Pending;
-		Pending.Id = Id;
-		Pending.Op = TEXT("session");
-		Pending.StartReal = FPlatformTime::Seconds();
-		Pending.Tick = [&Bridge, Old](FPending& P, double Now)
-		{
-			UWorld* Current = Bridge.GetGameWorld();
-			if (Current && Current != Old.Get() && Current->HasBegunPlay())
-			{
-				Bridge.Respond(P.Id, Running(true, Current));
-				return true;
-			}
-			if (Now - P.StartReal > 30.0)
-			{
-				Bridge.RespondError(P.Id, TEXT("Timed out reopening the map"), 500);
-				return true;
-			}
-			return false;
-		};
-		Bridge.AddPending(MoveTemp(Pending));
+		ReopenLevel(Bridge, Id, 1, World, Map);
 	}
 
 	void Pause(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Args)
 	{
-		UWorld* World = Bridge.GetGameWorld();
+		// The request's player's game ("player" n): one of several side by side pauses alone
+		UWorld* World = PlayerWorld(Bridge, Args);
 		if (!World)
 		{
 			Bridge.RespondError(Id, TEXT("No game is running"));
@@ -443,7 +516,7 @@ namespace
 		// A client can't pause the game: its server does, for every player, as the player's own controller there
 		// would (it also sends the pause to the clients at once: a paused server's clock no longer brings their update)
 		FString Why;
-		UWorld* Server = Bridge.GetServerWorld();
+		UWorld* Server = Bridge.GetServerWorld(World);
 		APlayerController* Pauser = ServerController(Server, PlayerController(World));
 		if (!Server)
 		{
@@ -479,10 +552,10 @@ namespace
 		Bridge.Respond(Id, Obj(MakeShared<FJsonObject>()));
 	}
 
-	void Ping(UPlaytestSubsystem& Bridge, int64 Id)
+	void Ping(UPlaytestSubsystem& Bridge, int64 Id, const TSharedPtr<FJsonObject>& Args)
 	{
 		TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
-		Result->SetField(TEXT("game_time"), PlaytestJson::Number(FMath::Max(0.0, Bridge.GameTime())));
+		Result->SetField(TEXT("game_time"), PlaytestJson::Number(FMath::Max(0.0, Bridge.GameTime(PlayerOf(Args)))));
 		Result->SetField(TEXT("wall_time"), PlaytestJson::Number((FDateTime::UtcNow() - FDateTime(1970, 1, 1)).GetTotalSeconds()));
 		Bridge.Respond(Id, Obj(Result));
 	}

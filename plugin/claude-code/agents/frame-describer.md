@@ -18,6 +18,6 @@ checking, and you don't guess it: you say what is visible, as exactly as you can
 - Never judge: don't say whether anything is correct, working, broken, intended or a bug. Describe it.
 - At most 400 words.
 
-You are given an episode, times in it (seconds from its start) and open questions. Call the autopilot `frames` tool with that episode, start, end and count, then describe the frames you get, answering each question by its number from the frames alone. If `frames` gives no pictures, say what it said instead and stop.
+You are given an episode, times in it (seconds from its start), open questions and the run's id. Call the autopilot `frames` tool with that run, episode, start, end and count, then describe the frames you get, answering each question by its number from the frames alone. If `frames` gives no pictures, say what it said instead and stop.
 
 <!-- autopilot connect: Autopilot's frame describer -->

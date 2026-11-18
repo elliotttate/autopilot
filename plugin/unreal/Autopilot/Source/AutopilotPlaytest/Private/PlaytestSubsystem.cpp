@@ -569,6 +569,12 @@ void UPlaytestSubsystem::SendHello()
 	// A request's "player" n is for player n of the editor's multiplayer Play In Editor (its own world: its keys, view,
 	// screen, UI, watch and context); how many there are is the editor's Play settings' (context's `players`)
 	Features.Add(MakeShared<FJsonValueString>(TEXT("players")));
+	// `session` start with "instances" N plays N games side by side (standalone Play In Editor instances, a window
+	// each): a request's "player" n is game n's, and that game alone is restarted, paused and recorded
+	if (GIsEditor)
+	{
+		Features.Add(MakeShared<FJsonValueString>(TEXT("instances")));
+	}
 	if (FPlaytestMedia::CanCapture())
 	{
 		Features.Add(MakeShared<FJsonValueString>(TEXT("media")));  // `record` and `capture` (a game that renders)
@@ -847,6 +853,29 @@ double UPlaytestSubsystem::GameTime() const
 	return World ? World->GetTimeSeconds() : -1.0;
 }
 
+double UPlaytestSubsystem::GameTime(int32 Player) const
+{
+	UWorld* World = GetPlayerWorld(Player);
+	return World ? World->GetTimeSeconds() : -1.0;
+}
+
+bool UPlaytestSubsystem::PlaysInstances() const
+{
+	const TArray<UWorld*> Worlds = GetPlayerWorlds();
+	if (Worlds.Num() < 2)
+	{
+		return false;
+	}
+	for (const UWorld* World : Worlds)
+	{
+		if (!World || World->GetNetMode() != NM_Standalone)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
 void UPlaytestSubsystem::QueueEvent(const TSharedRef<FJsonObject>& Event)
 {
 	OutgoingEvents.Add(MakeShared<FJsonValueObject>(Event));
@@ -859,7 +888,9 @@ void UPlaytestSubsystem::Respond(int64 Id, const TSharedPtr<FJsonValue>& Result)
 	Message->SetNumberField(TEXT("id"), (double)Id);
 	Message->SetBoolField(TEXT("ok"), true);
 	Message->SetField(TEXT("result"), Result.IsValid() ? Result : MakeShared<FJsonValueObject>(MakeShared<FJsonObject>()));
-	Message->SetField(TEXT("t"), GameTimeJson(GameTime()));
+	int32 Player = 1;
+	RequestPlayers.RemoveAndCopyValue(Id, Player);  // (the request's player's clock: each game side by side has its own)
+	Message->SetField(TEXT("t"), GameTimeJson(Player == 1 ? GameTime() : GameTime(Player)));
 	Send(Message);
 }
 
@@ -871,7 +902,9 @@ void UPlaytestSubsystem::RespondError(int64 Id, const FString& Error, int32 Stat
 	Message->SetBoolField(TEXT("ok"), false);
 	Message->SetNumberField(TEXT("status"), StatusCode);
 	Message->SetStringField(TEXT("error"), Error);
-	Message->SetField(TEXT("t"), GameTimeJson(GameTime()));
+	int32 Player = 1;
+	RequestPlayers.RemoveAndCopyValue(Id, Player);
+	Message->SetField(TEXT("t"), GameTimeJson(Player == 1 ? GameTime() : GameTime(Player)));
 	Send(Message);
 }
 
@@ -1312,6 +1345,11 @@ void UPlaytestSubsystem::TrimMemories()
 
 void UPlaytestSubsystem::HandleRequest(int64 Id, const FString& Op, const TSharedPtr<FJsonObject>& Args)
 {
+	double Player = 1.0;
+	if (Args.IsValid() && Args->TryGetNumberField(TEXT("player"), Player) && FMath::FloorToInt32(Player) > 1)
+	{
+		RequestPlayers.Add(Id, FMath::FloorToInt32(Player));  // (answered with that player's game time: Respond)
+	}
 	PlaytestOps::Handle(*this, Id, Op, Args);
 }
 

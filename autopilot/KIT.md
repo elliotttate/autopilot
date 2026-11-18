@@ -8,6 +8,7 @@ Reads (privileged: any object, any property, protected and Blueprint variables i
 - `game.pawn`, `game.controller`, `game.world`: paths ("" while there is no pawn, e.g. dead). `game.context(fresh=True)` re-reads.
 - `game.actors("BP_Door")` / `game.actors("Door")` / `game.actors("/Game/X/BP_Door.BP_Door_C")`: actor paths of a class (subclasses too). A Blueprint's name is resolved from the codex, a C++ class name from the project's modules.
 - `game.named("Door")`: actors whose object name contains the text. `game.all_actors()`.
+  Find an object the game spawns as it runs (a weapon, a projectile, an enemy) by its class (`game.actors("BP_Rifle")`), never by its instance name (`BP_Rifle_C_2`): that number comes from the order objects were created, which differs in every play and between the editor and a packaged build, where harnesses replay as regressions. Objects placed in the level keep their names.
 - `game.get(path, "Health")`: one property. `game.props(path)`: all of them. Components: `f"{actor}.MeshComp"`.
 - `game.call(path, "FunctionName", Param=value, ...)` -> dict (`ReturnValue` and out params); `game.ret(...)` -> its ReturnValue. An argument name the function doesn't take is refused (a GameError naming the ones it takes).
   Static library functions go to class default objects, e.g. `game.ret(GAMEPLAY, "GetPlayerCharacter", WorldContextObject=game.world, PlayerIndex=0)`.

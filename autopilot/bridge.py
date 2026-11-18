@@ -148,6 +148,9 @@ class Link:
         self.local_ops = {}
         self.media = None  # (what answers those: a studio_mcp.RobloxMedia, closed with the link)
         self.session_running = None  # whether a game runs, by the plugin's last `session` event (None: none yet)
+        # The games played side by side, each a run's (Lane, by its player n): their recorded frames and their events go
+        # to them, not to this link's listeners. serve_local shares one dict between a plugin's links (a reconnect)
+        self.lanes = {}
 
     # -- sending ------------------------------------------------------------------------------------
 
@@ -307,7 +310,9 @@ class Link:
                 frame = _jpeg_picture(frame)
                 if frame is None:
                     return
-            for listener in list(self.frame_listeners):  # (none: nobody records, the frame is dropped)
+            lane = self.lanes.get(_player_of(frame)) if self.lanes else None
+            for listener in list(lane.frame_listeners if lane is not None else self.frame_listeners):
+                # (none: nobody records, the frame is dropped; a game side by side's frames are its run's)
                 try:
                     listener(frame)
                 except Exception as e:
@@ -363,7 +368,15 @@ class Link:
             self.session_changes += 1
             if isinstance(event.get("running"), bool):
                 self.session_running = event["running"]
-        for listener in list(self.listeners):
+        listeners = list(self.listeners)
+        for player, lane in list(self.lanes.items()):
+            # (an event of one game side by side is its run's: its "player", and the detectors' findings, which are of
+            # player 1's game; the rest, heartbeats, logs and the session's, every run's)
+            if "player" in event or kind == "finding":
+                if (_player_of(event) if "player" in event else 1) != player:
+                    continue
+            listeners += list(lane.listeners)
+        for listener in listeners:
             try:
                 listener(event)
             except Exception as e:  # a listener's bug must not stop the link
@@ -391,6 +404,122 @@ class Link:
             return self.messages.get(timeout=timeout)
         except queue.Empty:
             return None
+
+
+def _player_of(message):
+    """The player a frame or event is of: its "player", 1 when it says none."""
+    try:
+        return max(1, int(message.get("player") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+# Frames a run sends to the plugin's tab that only one run at a time may send: the tab shows one run (its feed, status
+# line, usage and result). A game played beside the run the tab shows keeps them to itself (its run's agent and memory
+# have them; the user's own agent is told the result)
+TAB_FRAMES = ("status", "activity", "usage", "result", "run_kind", "bill", "run_started")
+
+
+class Lane:
+    """One of the games an editor plays side by side (Unreal's Play In Editor instances: the plugin's features say
+    "instances"), as the link its run plays through: every request goes as its player's ("player" n), a session start or
+    restart asks for the games side by side ("instances"), and the game's recorded frames, events and clock are its own.
+    Player 1's game is shown in the plugin's tab; another's run sends the tab nothing (TAB_FRAMES), and its game looks
+    like a game of one player (no "players" in the hello or context: the other games are other runs'). Everything else
+    is the link's (a LiveLink: a plugin that reconnects carries every game's run on).
+
+    busy_beside(): whether another game's run is going now; while one is, a session stop ends nothing (this run's game
+    is paused instead: the others play on)."""
+
+    def __init__(self, link, player, instances, busy_beside=None):
+        self._link = link
+        self.player = int(player)
+        self.instances = int(instances)
+        self.busy_beside = busy_beside or (lambda: False)
+        self.frame_listeners = []  # (the recording of this game)
+        self.listeners = []
+        self.rebound = []
+        self.game_time = None
+        self.game_time_at = None
+        self._last_status = None
+
+    def __getattr__(self, name):
+        return getattr(self._link, name)
+
+    @property
+    def base(self):
+        """The plugin's link now (a LiveLink's newest)."""
+        return getattr(self._link, "current", self._link)
+
+    @property
+    def current(self):
+        return self  # (what is recorded and listened to is this game's: media.Recorder, Feed.watch_rebind)
+
+    @property
+    def resumes(self):
+        return getattr(self.base, "resumes", 0)
+
+    @property
+    def lanes(self):
+        return getattr(self.base, "lanes", {})
+
+    def attach(self):
+        """This game's frames and events come to it from now (until detach)."""
+        self.lanes[self.player] = self
+        return self
+
+    def detach(self):
+        if self.lanes.get(self.player) is self:
+            self.lanes.pop(self.player, None)
+
+    @property
+    def hello(self):
+        hello = dict(self._link.hello or {})
+        hello["features"] = [f for f in hello.get("features") or [] if f not in ("players", "instances")]
+        hello["instance"] = self.player
+        return hello
+
+    @property
+    def findings(self):
+        return self.base.findings if self.player == 1 else []  # (the detectors watch player 1's game)
+
+    def send(self, frame):
+        if self.player != 1 and isinstance(frame, dict) and frame.get("type") in TAB_FRAMES:
+            return
+        self._link.send(frame)
+
+    def status(self, text):
+        if self.player == 1:
+            self._link.status(text)
+
+    def request(self, op, args=None, timeout=None):
+        return self.request_at(op, args, timeout)[0]
+
+    def request_at(self, op, args=None, timeout=None):
+        args = {**(args or {}), "player": self.player}
+        if op == "session":
+            action = args.get("action")
+            if action in ("start", "restart"):
+                args["instances"] = self.instances
+            elif action == "stop" and self.busy_beside():
+                # (the other games play on: this one holds still until its next run)
+                try:
+                    self._link.request_at("pause", {"paused": True, "player": self.player}, timeout=timeout)
+                except Exception:
+                    pass
+                return {"running": True, "scene": ""}, None
+        result, t = self._link.request_at(op, args, timeout)
+        if t is not None:
+            self.game_time, self.game_time_at = t, time.time()
+        if op == "context" and isinstance(result, dict):
+            # (a game of one player: the others are other runs' games)
+            result = {k: v for k, v in result.items() if k != "players"}
+            if isinstance(result.get("net"), dict):
+                result["net"] = {k: v for k, v in result["net"].items() if k not in ("players", "player")}
+        return result, t
+
+    def post(self, op, args=None):
+        self._link.post(op, {**(args or {}), "player": self.player})
 
 
 def _jpeg_picture(picture, args=None):
@@ -741,7 +870,7 @@ BRIDGE_ORIGINS = [None, "http://127.0.0.1", "http://localhost"]
 
 
 def serve_local(host="127.0.0.1", port=8765, wait=None, role="cli", announce_as=BRAIN_FILE, extra=None,
-                http_port=None):
+                http_port=None, give_up=None):
     """Listen for the plugin on this machine and return the Link once it has said hello (a service says where it is
     in brain_file(announce_as), with extra: announce()). Keeps
     listening afterwards: a plugin that reconnects (e.g. after the editor restarts) takes over the link's
@@ -750,7 +879,8 @@ def serve_local(host="127.0.0.1", port=8765, wait=None, role="cli", announce_as=
     and requests waiting across the reload are answered. While a run goes (state "run": the hello of the game it plays,
     cli.run_holds) another game's plugin is refused: every editor on this machine finds this service, and one that took
     the link over would get the run's input. http_port: also take plugins over HTTP there (HttpPeer; 0 for any free
-    port; None: no HTTP)."""
+    port; None: no HTTP). wait: seconds to wait for the plugin (None: as long as it takes), and give_up: a function
+    asked every second whether to stop waiting (a game started to connect has ended); either raises TimeoutError."""
     from websockets.sync.server import serve
 
     ready = queue.Queue()
@@ -791,6 +921,7 @@ def serve_local(host="127.0.0.1", port=8765, wait=None, role="cli", announce_as=
                                                                 "again once it has finished."}))
                 return
             link = Link(send)
+            link.lanes = state.setdefault("lanes", {})  # (the games side by side carry on through a reconnect)
             link.loopback = is_loopback(ws.remote_address)
             link.auth_token, link.mode = connection_auth(ws)
             link.session = f"local-{uuid.uuid4().hex[:12]}"
@@ -855,11 +986,17 @@ def serve_local(host="127.0.0.1", port=8765, wait=None, role="cli", announce_as=
         extra = {**(extra or {}), "http": f"http://{host}:{http.server_address[1]}{HTTP_PATH}"}
     if role == "service" and announce_as:  # (a brain that stays: the plugins may find it by brain_file())
         announce(f"ws://{host}:{server.socket.getsockname()[1]}/v1/bridge", brain_file(announce_as), extra)
-    try:
-        link = ready.get(timeout=wait)
-    except queue.Empty:
-        server.shutdown()
-        raise TimeoutError(f"the plugin didn't connect to ws://{host}:{port} within {wait}s")
+    deadline = None if wait is None else time.monotonic() + wait
+    link = None
+    while link is None:
+        left = None if deadline is None else deadline - time.monotonic()
+        if (left is not None and left <= 0) or (give_up is not None and give_up()):
+            server.shutdown()
+            raise TimeoutError(f"the plugin didn't connect to ws://{host}:{port} within {wait}s")
+        try:
+            link = ready.get(timeout=1.0 if give_up is not None else left)
+        except queue.Empty:
+            pass
     link.server = server
     link.server_state = state
     return link

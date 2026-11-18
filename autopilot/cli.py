@@ -4,11 +4,20 @@
         Wait for the editor's Autopilot tab to connect, then run each Verify, Play or Explore it starts.
     python -m autopilot play "Sell three crops at the market stall" [--port 8765] [--project PATH]
         Wait for the plugin to connect, then research, write and run a harness for one prompt and exit with its
-        result (see EXIT).
-    python -m autopilot codex --project PATH [--name NAME]
-        Build a project's codex (the game's code as text) without the game running.
+        result (see EXIT). --build GAME.exe [--game-folder <game>/Autopilot] [--watch]: on a Development build of the
+        game, with the codex and what runs learned from the game's folder (autopilot/gamefolder.py).
+    python -m autopilot codex --project PATH [--name NAME] [--out <game>/Autopilot]
+        Build a project's codex (the game's code as text) without the game running; --out: also export it, what
+        runs learned and the regressions, into the game's Autopilot folder, for replays and runs on builds elsewhere.
     python -m autopilot run memory/<project>/runs/<run>/harness.py [--seconds 60] [--no-restart]
         Play a saved harness again, with no language model (Jev decides), e.g. to watch it.
+    python -m autopilot regress [--project PATH | --build GAME.exe] [--regressions FOLDER] [--watch] [--only ID]
+        Replay the CONFIRMED verifications kept as regressions (autopilot/regress.py): their harnesses, the decision
+        model deciding in play (no agent; --recorded: the recorded decisions, no model), up to 3 tries each, on the
+        project's game headless, on a Development build of it (no editor, no project: QA machines, CI), or on the
+        editor's (--no-launch). Exits 0 when every one passes.
+    python -m autopilot qa
+        Autopilot QA: replays and Testing runs on a build, in a window (autopilot/qa.py).
     python -m autopilot uninstall [--keep-memory] [--yes]
         Remove Autopilot from this computer: its settings, keys, sign-in, memory and command (autopilot/uninstall.py).
         Shared run data already sent stays.
@@ -86,6 +95,12 @@ RESET_TRIES = 5
 # session loading its level: Unreal's Analyze stage reads "Waiting for PIE"). Its reading and probing time counts
 # from the end of the wait (agents/session.py, RESEARCH_SECONDS); past this the game is read as it is
 GAME_START_SECONDS = 600.0
+# The most runs `autopilot serve` plays at once when the user's own agent asks for several (start_run's `parallel`),
+# each in a game of its own side by side in the editor (AUTOPILOT_MAX_PARALLEL changes it): each game renders in a
+# window of its own, in the editor's one process
+MAX_PARALLEL = 3
+# How long the first of them waits for the games side by side to start (each loads the level)
+LANES_START_SECONDS = 300.0
 
 
 class Feed:
@@ -152,15 +167,19 @@ class LiveLink:
 
 @contextlib.contextmanager
 def run_holds(link):
-    """For the time of a run the link is its game's: another game's plugin is refused (bridge.serve_local)."""
+    """For the time of a run the link is its game's: another game's plugin is refused (bridge.serve_local). Runs at once
+    (Lanes) hold it until the last of them ends."""
     state = getattr(link, "_state", None)
     if isinstance(state, dict):
         state["run"] = getattr(link, "hello", None) or {}
+        state["holds"] = state.get("holds", 0) + 1
     try:
         yield
     finally:
         if isinstance(state, dict):
-            state.pop("run", None)
+            state["holds"] = max(0, state.get("holds", 1) - 1)
+            if not state["holds"]:
+                state.pop("run", None)
 
 
 # -- the project on disk ------------------------------------------------------------------------------------------
@@ -328,7 +347,12 @@ def prepare(link, path=None, level=None):
     if indexer is not None and indexer.running:
         print(f"codex: the export goes on while the run works ({codexmod.progress(indexer.status())})")
     elif not game.engine.has_export(game.codex.root):
-        print(game.engine.no_export_note)
+        if codexmod.from_game(game):
+            print("note: this is a build of the game, which carries no source: the run reads the code from the codex "
+                  "built from the game's source, and there is none here yet (`autopilot codex --project <the game's "
+                  "source>` makes one), so it plays without the game's code")
+        else:
+            print(game.engine.no_export_note)
     return project, game
 
 
@@ -622,6 +646,9 @@ def load_user_keys():
     account.load_user_settings()
 
 
+LAST_REPORT = {}  # the report of the run run_prompt finished last (`play --events` tells it whole)
+
+
 def run_prompt(link, prompt, path=None, model=None, timeout=None, stop=None, sent=None, steering=None, kind=None,
                play_minutes=None, trace=None, desk=None, level=None, aura_model=None, disable_premium_models=False,
                feed=None, explore_minutes=None, design_brief=None, thinking_level=None):
@@ -765,6 +792,8 @@ def run_prompt(link, prompt, path=None, model=None, timeout=None, stop=None, sen
             if share:
                 upload = (root, project if run else key, run)
     print(json.dumps(report, indent=1))
+    LAST_REPORT.clear()
+    LAST_REPORT.update(report if isinstance(report, dict) else {})
     if desk is not None:
         desk.end(report)  # (a run that ended before its session opened: the start call is told why)
     frame = scrub(result_frame(report, prompt, kind))  # (no secret leaves in what the model wrote)
@@ -923,14 +952,67 @@ def cmd_codex(args):
     remember_project(project, path, eng)
     cx = codexmod.build(project, path=path, engine=eng)
     print(f"The codex is at {cx.root}")
+    if getattr(args, "out", None):
+        from . import gamefolder
+
+        info = gamefolder.export(codexmod.project_dir(project), args.out, project, source=path)
+        n = info["regressions"]
+        print(f"Exported to {os.path.abspath(args.out)}: the codex ({info['codex_files']} files)"
+              + (f", {', '.join(info['memory'])}" if info["memory"] else "")
+              + f" and {n} regression{'' if n == 1 else 's'}")
     return 0
+
+
+def mirror_events(link, args):
+    """--events: the status lines and activity the run sends the plugin, told as events too (what the QA window
+    shows while a run plays)."""
+    if not getattr(args, "events", False):
+        return
+
+    def send(frame):
+        if isinstance(frame, dict) and frame.get("type") == "activity":
+            regress_event(args, "activity", **{k: frame.get(k) for k in ("t", "stage", "kind", "text")})
+        return link.current.send(frame)
+
+    def status(text):
+        regress_event(args, "status", text=text)
+        return link.current.status(text)
+
+    link.send, link.status = send, status
+
+
+REPORT_FIELDS = ("run", "project", "prompt", "outcome", "summary", "evidence", "findings", "alerts", "episodes",
+                 "seconds", "cost_usd", "visual")
 
 
 def cmd_play(link, args):
     asked, sent = link.hello.get("run"), []
-    with run_holds(link):
-        code = run_prompt(link, args.prompt, args.path, args.model, sent=sent, timeout=time_limit(asked),
-                          level=getattr(args, "level", None) or (asked or {}).get("level"))
+    project = codexmod.project_of(link.hello)
+    folder = None
+    if getattr(args, "game_folder", None):
+        from . import gamefolder
+
+        folder = gamefolder.resolve(args.game_folder)
+        if not folder:
+            print(f"note: no game's Autopilot folder at {args.game_folder}: the run plays with this machine's memory")
+        else:
+            for line in gamefolder.seed(codexmod.project_dir(project), folder):
+                print(f"Took {line}")
+    mirror_events(link, args)
+    limit = args.time_limit * 60 if getattr(args, "time_limit", None) else time_limit(asked)
+    try:
+        with run_holds(link):
+            code = run_prompt(link, args.prompt, args.path, args.model, sent=sent, timeout=limit,
+                              level=getattr(args, "level", None) or (asked or {}).get("level"))
+    except BaseException:
+        if getattr(args, "game_process", None) is not None:
+            processes.kill(args.game_process)  # (a build this started: nothing will tell it to quit now)
+        raise
+    report = {k: LAST_REPORT.get(k) for k in REPORT_FIELDS if k in LAST_REPORT}
+    if report.get("run"):
+        report["run_dir"] = os.path.join(codexmod.project_dir(report.get("project") or project), "runs",
+                                         report["run"])
+    regress_event(args, "report", exit_code=code, **report)
     if asked:
         # A game started with a run on its command line quits on the result: let it close first (closing at once can
         # cost it the result: a WebSocket client may drop what is buffered on close, as Godot's does). One that lost
@@ -946,6 +1028,8 @@ def cmd_play(link, args):
     deadline = time.time() + AFTER_RUN_SECONDS
     for thread in AFTER_RUN:
         thread.join(max(0.0, deadline - time.time()))
+    if getattr(args, "game_process", None) is not None:
+        processes.kill(args.game_process)  # (a build this started: it quits on its result, else it ends here)
     return code
 
 
@@ -989,28 +1073,105 @@ def cmd_run(link, args):
     return 0 if (result.get("status") or {}).get("state") == "done" else 1
 
 
-def regress_on(game, project, args, say=print):
-    """Replay the project's regressions (or --regressions') on game without a model (autopilot/regress.py): 0 when
-    every one passes. --json: the results there."""
+def regress_event(args, event, **fields):
+    """--events: one line of JSON on stdout per step of `autopilot regress` or `play` ({"event": ..., ...}: what the
+    QA window, autopilot/qa.py, follows), between its lines for people."""
+    if getattr(args, "events", False):
+        print(json.dumps(runtime.jsonable({"event": event, **fields})), flush=True)
+
+
+def wanted(args):
+    """The regression ids --only names (comma-separated, or the option given more than once), or None: all of them."""
+    ids = [i.strip() for given in (getattr(args, "only", None) or []) for i in str(given).split(",") if i.strip()]
+    return ids or None
+
+
+class NoDecisions(Exception):
+    """Why a replay with live decisions can't start (no decision model to ask), as words for the user."""
+
+
+@contextlib.contextmanager
+def replay_decisions(link, project, live):
+    """Jev's client for replays deciding live (regress.replay's client), inside a run with Aura when runs go through
+    Aura (billed as a run is: its relay carries the decision model's key); None with live False (recorded decisions,
+    no model). Raises NoDecisions when there is no decision model to ask."""
+    if not live:
+        yield None
+        return
+    if not aura.enabled() and not (os.environ.get("TYPESAFE_API_KEY") or "").strip():
+        raise NoDecisions(
+            "Replaying with live decisions needs Autopilot's decision model: sign in to Aura (`autopilot login`, then "
+            "replay with --aura) or add the line TYPESAFE_API_KEY=<the key> (https://typesafe.ai) to "
+            f"{account._user_env_path()}. Or replay with --recorded: the recorded decisions, no model.")
+    try:
+        run = start_aura_run(link, "verify", (getattr(link, "hello", None) or {}).get("project") or project) \
+            if aura.enabled() else None
+    except aura.Refused as e:
+        raise NoDecisions(e.message) from None
+    with run or contextlib.nullcontext():
+        yield runtime.jev_client()
+
+
+def regress_on(game, project, args, say=print, link=None):
+    """Replay the project's regressions (or --regressions') on game (autopilot/regress.py), their decisions made live
+    by the decision model (with no agent), or the recorded ones with --recorded (no model): 0 when every one passes.
+    The project's: those in the game's own folder (exported) and its memory (regress.folders). --only: those
+    regressions alone. Their traces and the results (results.json) go to --out, by default a new folder under the
+    settings folder's regress/; --json: the results there too."""
     from . import regress
 
     root = codexmod.project_dir(project)
-    base = getattr(args, "regressions", None) or regress.folder(project, root)
-    regs = regress.listing(base) if os.path.isdir(base) else []
+    given = getattr(args, "regressions", None)
+    if not given and getattr(args, "game_folder", None):
+        from . import gamefolder
+
+        folder = gamefolder.resolve(args.game_folder)
+        given = (gamefolder.regressions(folder) if folder else None) or os.path.join(args.game_folder, "regressions")
+    bases = [given] if given else regress.folders(project, root)
+    regs = regress.listing_all(bases)
+    only = wanted(args)
+    if only:
+        known = {regress.describe(r)["id"]: r for r in regs}
+        for rid in only:
+            if rid not in known:
+                say(f"No regression {rid} there")
+        regs = [known[rid] for rid in dict.fromkeys(only) if rid in known]
+    where = ", ".join(bases) or given or regress.folder(project, root)
+    out = getattr(args, "out", None) or regress.results_dir()
+    regress_event(args, "regressions", project=project, folders=bases, out=out,
+                  items=[regress.describe(r) for r in regs])
     if not regs:
-        say(f"No regressions at {base}")
+        say(f"No regressions at {where}")
         summary = regress.summary([])
     else:
-        say(f"Replaying {len(regs)} regression(s) from {base}, without a model")
-        results = regress.replay_all(game, regs, project_root=root, frozen_lib=getattr(args, "frozen_lib", False),
-                                     seconds=getattr(args, "seconds", None), say=say,
-                                     retries=getattr(args, "retries", regress.RETRIES))
+        live = not getattr(args, "recorded", False)
+        retries = getattr(args, "retries", None)
+        try:
+            with replay_decisions(link or getattr(game, "link", None), project, live) as client:
+                say(f"Replaying {len(regs)} regression(s) from {where}, "
+                    + ("the decision model deciding in play (no agent)" if live else
+                       "with their recorded decisions (no model)"))
+                results = regress.replay_all(game, regs, project_root=root,
+                                             frozen_lib=getattr(args, "frozen_lib", False),
+                                             seconds=getattr(args, "seconds", None), say=say,
+                                             retries=regress.RETRIES if retries is None else retries, out_dir=out,
+                                             on_event=lambda e: regress_event(args, e.pop("event"), **e),
+                                             level=getattr(args, "level", None), client=client)
+        except NoDecisions as e:
+            say(str(e))
+            regress_event(args, "error", message=str(e))
+            return 1
         summary = regress.summary(results)
         say(f"{summary['passed']}/{summary['total']} passed"
             + (f" ({len(summary['flaky'])} flaky: passed only on a retry)" if summary["flaky"] else ""))
-    if getattr(args, "json", None):
-        with open(args.json, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=1)
+    os.makedirs(out, exist_ok=True)
+    files = [os.path.join(out, "results.json")] + ([args.json] if getattr(args, "json", None) else [])
+    for file in files:
+        with open(file, "w", encoding="utf-8") as f:
+            json.dump(runtime.jsonable(summary), f, indent=1)
+    if regs:
+        say(f"Results and traces: {out}")
+    regress_event(args, "summary", **{k: v for k, v in summary.items() if k != "results"}, out=out)
     return 0 if summary["passed"] == summary["total"] else 1
 
 
@@ -1019,10 +1180,82 @@ def cmd_regress(link, args):
     game = Game(link, codexmod.Codex.for_project(project))
     try:
         with run_holds(link):  # (the replays drive the game: another game's plugin can't take the link over)
-            return regress_on(game, project, args)
+            return regress_on(game, project, args, link=link)
     finally:
         if getattr(args, "game_process", None) is not None:
             processes.kill(args.game_process)
+
+
+def free_port():
+    """A port free on this machine now (for a game this process starts and tells where to connect)."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def launch_build(args, url, say=print):
+    """Start the built game --build names (an Unreal packaged game, a Unity player, a Godot export: a Development
+    build, which carries the Autopilot plugin), connecting to url a moment after this process listens: headless, or
+    in a window with --watch. The Popen is kept on args.game_process."""
+    eng, exe = engines.find_build(args.build)
+    if not eng:
+        raise SystemExit(f"{args.build} isn't a game build Autopilot knows: an Unreal packaged game, a Unity player "
+                         "or a Godot export (Unreal: <Game>.exe beside its Engine/ folder; Unity: <Game>.exe beside "
+                         "<Game>_Data/; Godot: the executable with its .pck)")
+    log = os.path.join(regress_logs(), f"build-{time.strftime('%Y%m%d-%H%M%S')}.log")
+    cmd = eng.launch_command(None, url, log, exe=exe, headless=not getattr(args, "watch", False))
+    say(f"Starting {eng.title or eng.name} build {exe} ({'in a window' if args.watch else 'headless'}; its log: {log})")
+    regress_event(args, "launching", engine=eng.name, build=exe, log=log, watch=bool(args.watch))
+    args.game_log = log
+    start_game(args, cmd)
+    return True
+
+
+def game_ended(args):
+    """Whether the game regress started has ended already (it can't connect any more)."""
+    proc = getattr(args, "game_process", None)
+    return proc is not None and proc.poll() is not None
+
+
+def game_never_connected(args):
+    """The game regress started didn't connect within --connect-timeout: say why it may not have (it ended, or it
+    carries no Autopilot plugin: a Shipping or release build), end it, exit 1."""
+    proc = getattr(args, "game_process", None)
+    code = proc.poll() if proc is not None else None
+    log = getattr(args, "game_log", None)
+    if proc is not None and code is not None:
+        why = f"the game ended (exit code {code}) before it connected"
+    else:
+        why = f"the game didn't connect within {args.connect_timeout:.0f}s"
+    hint = (" A build connects only when it carries the Autopilot plugin: a Development build (Unreal: not Shipping; "
+            "Unity: Development Build ticked, or the AUTOPILOT_PLAYTEST define) with the plugin in its project."
+            if getattr(args, "build", None) else "")
+    message = f"{why[:1].upper()}{why[1:]}.{hint}" + (f" Its log: {log}" if log else "")
+    print(message)
+    regress_event(args, "error", message=message, log=log)
+    if proc is not None:
+        processes.kill(proc)
+    return 1
+
+
+def regress_logs():
+    folder = os.path.join(os.path.dirname(bridge.brain_file()), "logs")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def start_game(args, cmd):
+    def start():
+        time.sleep(1.5)
+        import subprocess
+
+        args.game_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                             **processes.GROUP)
+        processes.track(args.game_process)
+
+    threading.Thread(target=start, daemon=True).start()
 
 
 def launch_headless(args, url, say=print):
@@ -1035,20 +1268,13 @@ def launch_headless(args, url, say=print):
     log = os.path.join(HERE, "logs", f"regress-{time.strftime('%Y%m%d-%H%M%S')}.log")
     os.makedirs(os.path.dirname(log), exist_ok=True)
     try:
-        cmd = eng.launch_command(path, url, log, exe=getattr(args, "engine", None))
+        cmd = eng.launch_command(path, url, log, exe=getattr(args, "engine", None),
+                                 headless=not getattr(args, "watch", False))
     except NotImplementedError as e:
         say(f"{e}. Waiting for the plugin instead: open the project in its editor, with the plugin connecting to {url}")
         return False
-
-    def start():
-        time.sleep(1.5)
-        import subprocess
-
-        args.game_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                             **processes.GROUP)
-        processes.track(args.game_process)
-
-    threading.Thread(target=start, daemon=True).start()
+    args.game_log = log
+    start_game(args, cmd)
     return True
 
 
@@ -1089,37 +1315,119 @@ def external_run(params):
         run["time_limit_minutes"] = params["minutes"]
     if str(params.get("level") or "").strip():
         run["level"] = str(params["level"]).strip()
+    try:  # (how many runs its agent keeps going at once: the games the editor plays side by side, cmd_serve)
+        if int(params.get("parallel") or 1) > 1:
+            run["parallel"] = int(params["parallel"])
+    except (TypeError, ValueError):
+        pass
     if isinstance(params.get("trace"), dict):  # (where the run was asked for, as its MCP server was told)
         run["trace"] = params["trace"]
     return run
 
 
+def max_parallel():
+    """The most runs `autopilot serve` plays at once (AUTOPILOT_MAX_PARALLEL, default MAX_PARALLEL), each in a game of
+    its own beside the others."""
+    try:
+        return max(1, int(os.environ.get("AUTOPILOT_MAX_PARALLEL") or MAX_PARALLEL))
+    except ValueError:
+        return MAX_PARALLEL
+
+
+def plays_side_by_side(link):
+    """Whether the plugin plays games side by side (its hello's features say "instances": Unreal's editor, as Play In
+    Editor instances), so runs can go at once."""
+    return "instances" in ((getattr(link, "hello", None) or {}).get("features") or [])
+
+
+class Lanes:
+    """The runs going in `autopilot serve`, by the game each plays (its lane: player n of the games the editor plays
+    side by side; 1 when one run plays the editor's own play session, as before). The tab's runs and the user's own
+    agent's go one at a time, unless the agent asks for several at once (start_run's `parallel`) and the plugin plays
+    games side by side: then up to `size` go at once, each through a bridge.Lane. The size is set by the first run
+    started while none goes, and holds until every run has ended (the play session has that many games)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.going = {}  # lane -> (thread, stop event, steering)
+        self.size = 1
+        self.played = set()  # the lanes whose game an earlier run played (restarted for the next: a fresh level)
+        self.setup = threading.Lock()  # (the games side by side are started once: the first lane's run starts them)
+
+    def prune(self):
+        """Forget the runs that have ended (under self.lock); whether any goes."""
+        for lane in [n for n, g in self.going.items() if not g[0].is_alive()]:
+            self.going.pop(lane, None)
+        if not self.going:
+            self.size, self.played = 1, set()
+        return bool(self.going)
+
+    def busy(self):
+        with self.lock:
+            return self.prune()
+
+    def busy_beside(self, lane):
+        with self.lock:
+            return any(n != lane and g[0].is_alive() for n, g in self.going.items())
+
+    def take(self, want):
+        """A free lane for a run (want: how many its agent keeps going at once, 1 or more), or (None, why not)."""
+        if not self.prune():
+            self.size = max(1, want)
+        if len(self.going) >= self.size:
+            if self.size == 1:
+                return None, ("A run is going in the editor: stop it there (or let it finish), then call start_run "
+                              "again.")
+            return None, (f"{self.size} runs are going, the most this play session plays at once: start this one once "
+                          "one of them has reported.")
+        return next(n for n in range(1, self.size + 1) if n not in self.going), None
+
+    def stop_all(self):
+        with self.lock:
+            for thread, stop, _ in self.going.values():
+                if thread.is_alive():
+                    stop.set()
+
+    def shown(self):
+        """The run the tab shows: lane 1's (Stop and Steer from the tab reach it), or None."""
+        with self.lock:
+            going = self.going.get(1)
+            return going if going is not None and going[0].is_alive() else None
+
+
 def cmd_serve(link, args):
     """Run what the Autopilot tab starts, one run at a time, until stopped (Ctrl+C). Frames from the plugin are read
     while a run plays: Stop ends it, Steer passes the user's words on. args.control (an agents.external.Control): runs
-    the user's own agent starts (`autopilot mcp`), one at a time with the tab's."""
+    the user's own agent starts (`autopilot mcp`), one at a time with the tab's, or several at once when it asks
+    (start_run's `parallel`) and the plugin plays games side by side (Lanes): each run plays a game of its own."""
     run = asked = link.hello.get("run")  # (a game started with a run on its command line)
     send_memory_state(link)
     account.send_state(link)
     sign_in = account.SignIn(link)  # (the plugin's requests to sign in to Aura: autopilot/account.py)
     done = []  # the command-line run's result, for a plugin that lost it and asks again (answer_again)
-    going = None  # (thread, stop event, steering) of the run going now
-    lock = threading.Lock()  # (going, as the tab's frames and the user's own agent's start calls see it)
+    lanes = Lanes()  # the runs going now
+    lock = lanes.lock  # (what goes, as the tab's frames and the user's own agent's start calls see it)
     feed = Feed()  # the latest run's activity events, for a plugin that asks for them again (hello activity_since)
     feed.watch_rebind(link)
 
-    def start(run, prompt, stop, steering, desk=None):
+    def start(run, prompt, stop, steering, desk=None, lane=None):
         nonlocal done
         sent = []
+        played = link
+        if lane is not None:  # (one of the games side by side: its own, started first)
+            played = bridge.Lane(link, lane, lanes.size, busy_beside=lambda: lanes.busy_beside(lane)).attach()
         try:
+            if lane is not None:
+                ready_lane(played, lane)
             with run_holds(link):
-                run_prompt(link, prompt, args.path, args.model, timeout=time_limit(run), sent=sent, stop=stop.is_set,
-                           steering=steering, kind=run.get("kind") if run.get("kind") in aura.KINDS else None,
+                run_prompt(played, prompt, args.path, args.model, timeout=time_limit(run), sent=sent,
+                           stop=stop.is_set, steering=steering,
+                           kind=run.get("kind") if run.get("kind") in aura.KINDS else None,
                            play_minutes=play_minutes(run), trace=run.get("trace"), desk=desk, level=run.get("level"),
                            aura_model=run.get("model"),
                            disable_premium_models=run.get("disable_premium_models") is True,
                            thinking_level=run.get("thinking_level"),
-                           feed=feed, explore_minutes=explore_minutes(run),
+                           feed=feed if lane in (None, 1) else None, explore_minutes=explore_minutes(run),
                            design_brief=str(run.get("design_brief") or "").strip() or None)
         except Exception as e:
             print(f"The run failed: {type(e).__name__}: {e}")
@@ -1131,24 +1439,45 @@ def cmd_serve(link, args):
                       "summary": f"The run failed: {e}", "evidence": []}
             sent.append({"type": "result", "result": scrub(result_frame(failed, prompt, kind))})
             try:
-                link.send(sent[-1])
+                played.send(sent[-1])
             except Exception:
                 pass
+        finally:
+            if lane is not None:
+                played.detach()
+                with lock:
+                    lanes.played.add(lane)
         if run is asked and sent:
             done = [(time.time(), run, sent[-1], link.current)]
         send_memory_state(link)  # (what the run added)
 
+    def ready_lane(played, lane):
+        """The lane's game plays, fresh: the games side by side started (by the first lane's run, once; the others
+        wait for it), and a game an earlier run played started over."""
+        with lanes.setup:
+            played.request("session", {"action": "start"}, timeout=LANES_START_SECONDS)
+        if lane in lanes.played:
+            played.request("session", {"action": "restart"}, timeout=120)
+        print(f"Lane {lane}: its game plays ({lanes.size} side by side)")
+
     def begin(run, prompt, desk=None):
-        """Start the run unless one is going; whether it started."""
-        nonlocal going
+        """Start the run in a free lane; None once it has started, else why it hasn't."""
         with lock:
-            if going is not None and going[0].is_alive():
-                return False
+            want = 1
+            if desk is not None and plays_side_by_side(link):  # (the tab's runs are one at a time)
+                want = min(max_parallel(), max(1, int(run.get("parallel") or 1)))
+            elif lanes.prune():
+                return "A run is going in the editor: stop it there (or let it finish), then start again."
+            lane, refused = lanes.take(want)
+            if refused:
+                return refused
             stop, steering = threading.Event(), Steering()
-            thread = threading.Thread(target=start, args=(run, prompt, stop, steering, desk), daemon=True)
-            going = (thread, stop, steering)
+            thread = threading.Thread(target=start, args=(run, prompt, stop, steering, desk,
+                                                          lane if lanes.size > 1 else None), daemon=True)
+            thread.desk = desk
+            lanes.going[lane] = (thread, stop, steering)
             thread.start()
-            return True
+            return None
 
     def start_external(params, desk):
         """A start call of the user's own agent (autopilot/agents/external.py): None once its run has started, else
@@ -1161,27 +1490,35 @@ def cmd_serve(link, args):
         if missing:
             return missing
         run = external_run(params)
-        if not begin(run, prompt_of(run), desk):
-            return ("A run is going in the editor: stop it there (or let it finish), then call start_run again.")
-        try:  # (the tab shows the run as one of its own: docs/protocol.md, run_started)
-            link.send({"type": "run_started", "run": dict(run, by=desk.client or "mcp")})
-        except Exception:
-            pass
+        refused = begin(run, prompt_of(run), desk)
+        if refused:
+            return refused
+        if lanes_shows(desk):  # (the tab shows the run as one of its own: docs/protocol.md, run_started)
+            try:
+                link.send({"type": "run_started", "run": dict(run, by=desk.client or "mcp")})
+            except Exception:
+                pass
         return None
+
+    def lanes_shows(desk):
+        """Whether the tab shows the run desk is for (one run at a time, or lane 1's of several)."""
+        with lock:
+            if lanes.size == 1:
+                return True
+            going = lanes.going.get(1)
+            return going is not None and getattr(going[0], "desk", None) is desk
 
     control = getattr(args, "control", None)
     if control is not None:
         control.starter = start_external
 
     while True:
-        if run and going is None:
+        if run and not lanes.busy():
             prompt = prompt_of(run)
             if prompt:
                 begin(run, prompt)
             run = None
-        with lock:
-            if going is not None and not going[0].is_alive():
-                going = None
+        lanes.busy()
         msg = link.next_message(timeout=1.0)
         if msg is None:
             continue
@@ -1191,7 +1528,7 @@ def cmd_serve(link, args):
             send_memory_state(link, msg)
             account.send_state(link)
             feed.watch_rebind(link)
-            if going is not None:  # (the run goes on through the new link: what the project muted, there too)
+            if lanes.busy():  # (the runs go on through the new link: what the project muted, there too)
                 folder = codexmod.project_dir(codexmod.project_of(link.hello))
                 detectorsmod.send(link, folder, wait=False)
                 detectorsmod.watch(link, folder)
@@ -1204,17 +1541,17 @@ def cmd_serve(link, args):
         elif account.handle(link, msg, sign_in):
             pass
         elif kind == "start":
-            if going is not None:
+            if lanes.busy():
                 link.send({"type": "status", "text": "A run is going: steer it, or stop it first"})
             else:
                 run = msg.get("run") or {}
-        elif kind == "stop" and going is not None:
-            going[1].set()
+        elif kind == "stop" and lanes.busy():
+            lanes.stop_all()  # (the tab's Stop: every run going, the games side by side too)
             link.status("Stopping")
-        elif kind == "steer" and going is not None:
+        elif kind == "steer" and lanes.shown() is not None:
             # (mode: "hint", the default, or "redirect", which ends the episode playing now; see bridge.BRAIN_FEATURES)
             mode = msg.get("mode") if msg.get("mode") in STEER_MODES else HINT
-            if going[2].add(msg.get("text"), mode):
+            if lanes.shown()[2].add(msg.get("text"), mode):
                 link.status(("Redirecting: " if mode == REDIRECT else "Hint: ") + str(msg.get("text")).strip())
         elif kind == "feedback":
             take_feedback(link, msg)
@@ -1223,7 +1560,7 @@ def cmd_serve(link, args):
             send_memory_state(link)  # (the switch shows what the file says now)
         elif kind == "clear_memory":
             with lock:  # (a start call of the user's own agent waits while the memory moves)
-                if going is not None and going[0].is_alive():
+                if lanes.prune():
                     answer = {"type": "memory_cleared", "ok": False,
                               "message": "A run is going: stop it or let it finish first."}
                 else:
@@ -1260,7 +1597,7 @@ def parser():
                    help="end once the process PID has ended (for a program that starts Autopilot and owns it)")
     p = sub.add_parser("play", help="run one prompt and exit with its result")
     p.add_argument("prompt")
-    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--port", type=int, help="where to listen for the game (default 8765; with --build any free port)")
     p.add_argument("--http-port", type=int, help=HTTP_HELP)
     p.add_argument("--project", dest="path", help=project_help)
     p.add_argument("--model", help="the language model (default: AUTOPILOT_MODEL)")
@@ -1268,9 +1605,23 @@ def parser():
                                    "agent decides, else the one open in the editor)")
     p.add_argument("--aura", action="store_true",
                    help="sign in with Aura: run on your Aura plan instead of your own keys")
+    p.add_argument("--build", help="a built game to play the prompt on, with no editor: an Unreal packaged game, a "
+                                   "Unity player or a Godot export (a Development build, which carries the plugin)")
+    p.add_argument("--watch", action="store_true", help="show the game in a window (default: headless)")
+    p.add_argument("--game-folder", help="the game's Autopilot folder (<game>/Autopilot): its code index and what runs "
+                                         "learned are brought into this machine's memory first (autopilot/"
+                                         "gamefolder.py)")
+    p.add_argument("--time-limit", type=float, metavar="MINUTES", help="the run's whole time limit")
+    p.add_argument("--events", action="store_true", help="also print each step as one line of JSON (for tools)")
+    p.add_argument("--connect-timeout", type=float, default=180.0,
+                   help="seconds a build this starts has to connect (default 180)")
     c = sub.add_parser("codex", help="build a project's codex without the game running")
     c.add_argument("--project", dest="path", required=True, help=project_help)
     c.add_argument("--name", help="the project's name in memory/ (default: from its path)")
+    c.add_argument("--out", metavar="FOLDER",
+                   help="also write the codex, what runs learned and the regressions into the game's Autopilot "
+                        "folder there (e.g. <game>/Autopilot), for replays and runs on builds on other machines "
+                        "(autopilot/gamefolder.py)")
     r = sub.add_parser("run", help="play a saved harness again (no language model)")
     r.add_argument("harness")
     r.add_argument("--seconds", type=float, default=60)
@@ -1278,21 +1629,52 @@ def parser():
     r.add_argument("--no-restart", action="store_true", help="go on from where the game is")
     r.add_argument("--aura", action="store_true",
                    help="sign in with Aura: run on your Aura plan instead of your own keys")
-    rg = sub.add_parser("regress", help="replay the regressions (harnesses of CONFIRMED claims) without a model: "
-                                        "starts the game headless, or waits for the editor (--no-launch)")
+    rg = sub.add_parser("regress", help="replay the regressions (harnesses of CONFIRMED claims), the decision model "
+                                        "deciding in play (no agent): starts the game headless (--project), a build "
+                                        "of it (--build), or waits for the editor (--no-launch)")
     rg.add_argument("--project", dest="path", help=project_help)
-    rg.add_argument("--regressions", help="a regressions folder (default: the project's, AUTOPILOT_REGRESSIONS or "
-                                          "memory/<project>/regressions)")
-    rg.add_argument("--seconds", type=float, help="each replay's longest episode (default: 1.5x the recorded one)")
+    rg.add_argument("--build", help="a built game to replay them on, with no editor and no project: an Unreal "
+                                    "packaged game, a Unity player or a Godot export (a Development build, which "
+                                    "carries the Autopilot plugin); give --regressions too on a machine without the "
+                                    "game's Autopilot memory")
+    rg.add_argument("--watch", action="store_true", help="show the game in a window (default: headless)")
+    rg.add_argument("--game-folder", help="the game's Autopilot folder (<game>/Autopilot): its regressions/ (as "
+                                          "--regressions) and code index")
+    rg.add_argument("--regressions", help="a regressions folder, such as the game's Autopilot/regressions (default: "
+                                          "AUTOPILOT_REGRESSIONS, else the game's own folder's (exported) and its "
+                                          "memory's)")
+    rg.add_argument("--only", action="append", metavar="ID",
+                    help="replay these regressions alone (their ids, the run ids: comma-separated or repeated)")
+    rg.add_argument("--out", help="where the replays' traces and results.json go (default: a new folder under "
+                                  "Autopilot's settings folder, regress/<time>)")
+    rg.add_argument("--events", action="store_true", help="also print each step as one line of JSON (for tools)")
+    rg.add_argument("--connect-timeout", type=float, default=180.0,
+                    help="seconds a game this starts has to connect (default 180)")
+    rg.add_argument("--seconds", type=float, help="each replay's longest episode (default: as long as the recorded "
+                                                  "one was allowed, else 3x the recorded one)")
+    rg.add_argument("--recorded", action="store_true",
+                    help="replay the recorded decisions, with no model (for a game that plays the same each time); "
+                         "by default the decision model decides in play, as it did when the claim was confirmed")
+    rg.add_argument("--aura", action="store_true",
+                    help="sign in with Aura: the decision model runs on your Aura plan instead of your own key")
+    rg.add_argument("--level", help="the level to replay a regression in when it doesn't name one (one saved before "
+                                    "regressions kept their level): a path such as /Game/Maps/Arena; a build starts "
+                                    "in its default map, often a menu")
     rg.add_argument("--frozen-lib", action="store_true",
                     help="use each regression's own lib.py snapshot, not the project's lib.py now")
     rg.add_argument("--json", help="write the results there")
-    rg.add_argument("--retries", type=int, default=1,
-                    help="replay a failed regression again this many times; one that then passes is reported flaky "
-                         "(default 1; 0: no retries)")
-    rg.add_argument("--port", type=int, default=8765)
+    rg.add_argument("--retries", type=int,
+                    help="play a regression that didn't pass again up to this many times: it passes on the first try "
+                         "that does (default 2: up to 3 tries; 0: one try); with --recorded, one that passes only on a "
+                         "retry is reported flaky")
+    rg.add_argument("--port", type=int, help="where to listen for the game (default 8765; with --build any free "
+                                             "port)")
     rg.add_argument("--engine", help="the game's executable (default: the engine adapter's)")
     rg.add_argument("--no-launch", action="store_true", help="don't start the game: wait for the editor's plugin")
+    qa = sub.add_parser("qa", help="Autopilot QA: a window that replays a game's regressions on a build of it "
+                                   "(autopilot regress --build) and runs tests on it (autopilot play --build)")
+    qa.add_argument("--build", help="the build to start with (remembered from the last time otherwise)")
+    qa.add_argument("--regressions", help="the regressions folder to start with (the game's Autopilot/regressions)")
     li = sub.add_parser("login", help="sign in to Aura on its website (for runs with Aura without the Aura app)")
     li.add_argument("--server", help=SERVER_HELP)
     li.add_argument("--another-account", action="store_true",
@@ -1330,6 +1712,10 @@ def main(argv=None):
 
         return mcp.main()
     processes.contain()
+    if args.cmd == "qa":  # (a window: each replay is an `autopilot regress` it starts, autopilot/qa.py)
+        from . import qa
+
+        return qa.main(args)
     if getattr(args, "exit_with", None):
         processes.exit_with(args.exit_with, finish=finish_after_run)
     processes.keep_responsive()
@@ -1371,15 +1757,33 @@ def main(argv=None):
 
         args.control = Control()
         extra = {"control": args.control.url}
-    if args.cmd == "regress" and args.path and not args.no_launch:
-        launch_headless(args, f"ws://127.0.0.1:{args.port}/v1/bridge")
-    print(f"Waiting for the plugin on ws://127.0.0.1:{args.port}/v1/bridge ...")
+    wait, launched = None, False
     http_port = getattr(args, "http_port", None)
+    if args.cmd in ("regress", "play"):
+        if args.build and args.path:
+            raise SystemExit("Give --build or --project, not both")
+        if args.port is None:  # (a build is told where to connect: any free port, never another Autopilot's)
+            args.port = free_port() if args.build else 8765
+        url = f"ws://127.0.0.1:{args.port}/v1/bridge"
+        if args.build and not getattr(args, "no_launch", False):
+            launched = launch_build(args, url)
+            wait, http_port = args.connect_timeout, False  # (a build connects over WebSocket only)
+        elif args.cmd == "regress" and args.path and not args.no_launch:
+            # (no time limit: an editor run headless may import the project first; one that ends is given up on)
+            launched = launch_headless(args, url)
+    print(f"Waiting for the plugin on ws://127.0.0.1:{args.port}/v1/bridge ...")
     if http_port is None:
         http_port = args.port + 1 if args.port else 0
-    link = bridge.serve_local(port=args.port, role="service" if args.cmd == "serve" else "cli", announce_as=announce_as,
-                              extra=extra, http_port=http_port)
+    try:
+        link = bridge.serve_local(port=args.port, role="service" if args.cmd == "serve" else "cli",
+                                  announce_as=announce_as, extra=extra, http_port=http_port or None, wait=wait,
+                                  give_up=(lambda: game_ended(args)) if launched else None)
+    except TimeoutError:
+        return game_never_connected(args)
     print(f"Connected: {link.hello.get('project')} ({link.hello.get('host')}, {engines.for_hello(link.hello).title})")
+    if args.cmd in ("regress", "play"):
+        regress_event(args, "connected", project=link.hello.get("project"), host=link.hello.get("host"),
+                      engine=engines.for_hello(link.hello).name)
     link = LiveLink(link)
     return {"play": cmd_play, "run": cmd_run, "serve": cmd_serve, "regress": cmd_regress}[args.cmd](link, args)
 
