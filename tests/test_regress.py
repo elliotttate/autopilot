@@ -190,6 +190,30 @@ def test_a_replay_may_play_as_long_as_the_recorded_episode_was_allowed(tmp_path,
     assert regress.episode_limit({"max_seconds": 150}, seconds=40) == 40
 
 
+def test_a_replay_plays_on_through_stalls_and_says_so(tmp_path, memory, monkeypatch):
+    """A stall ends a run's episode so the agent revises the plan; a replay has no agent, so it plays on (the runtime's
+    stall_ends=False) to the episode's time limit, and its result tells the stalls it played through."""
+    run_dir, report = confirmed(tmp_path, memory)
+    reg = regress.save(run_dir, report, "Tiny", project_root=memory)
+    asked = {}
+    stalls = [{"kind": "no progress", "since_t": 96.43, "t": 156.44, "seconds": 60.0}]
+
+    class Played:
+        def __init__(self, game, harness, trace, **kw):
+            asked.update(kw)
+
+        def run(self):
+            return {"reason": "status done", "status": {"state": "done", "note": "all three held", "evidence": {}},
+                    "decisions": 3, "stalls_passed": stalls}
+
+    monkeypatch.setattr(regress.runtime, "Runtime", Played)
+    game = types.SimpleNamespace(restart=lambda map=None: None, pause=lambda paused: None, release_all=lambda: None)
+    r = regress.replay(game, reg, project_root=memory)
+    assert asked["stall_ends"] is False
+    assert r["passed"] and r["stalls"] == stalls
+    assert r["why"] == "ended done: all three held; played on through 1 stall (no progress at t=96.43-156.44 s)"
+
+
 def test_a_regression_keeps_its_level_and_a_replay_opens_it(tmp_path, memory):
     """A build starts in its default map (often a menu), not the level the editor had open: a regression keeps the
     level its episode played and a replay opens it; one saved before that is replayed in --level."""

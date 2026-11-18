@@ -32,7 +32,10 @@ regression's own `ignore` list leaves keys out of it. One that doesn't pass is p
 2: up to 3 tries) and passes on the first try that does: a claim that something can happen holds when play shows it
 once, and a game with bots doesn't always give the chance. With recorded decisions every try plays the same, so a
 pass after a failed try is reported flaky (its harness reads the game too tightly). A replay's episode may last as
-long as the recorded one was allowed to (regression.json's `max_seconds`), else 3x the recorded one.
+long as the recorded one was allowed to (regression.json's `max_seconds`), else 3x the recorded one. A stall (no
+progress for the harness's stall_seconds) ends a run's episode so the agent revises the plan; a replay has no agent,
+so it plays on through it to that limit (noted with the result), and ends early only on a frozen player: one that
+didn't move and was sent no input since the last progress.
 
 Only an episode that started from a restarted level is saved (one that went on from where an earlier episode left
 play needs that state, which a replay can't rebuild): the latest such episode that ended done, else none.
@@ -443,7 +446,9 @@ def replay(game, reg, project_root=None, frozen_lib=False, seconds=None, restart
             game.restart(map=start_level(harness, spec, level))
         game.pause(False)
         decider = client if client is not None else ReplayJev(spec.get("picks"), spec.get("extras"))
-        rt = runtime.Runtime(game, harness, trace, client=decider, max_seconds=limit)
+        # No agent revises a replay's plan, so a stall doesn't end it (only a frozen player does): it plays on to the
+        # episode's time limit
+        rt = runtime.Runtime(game, harness, trace, client=decider, max_seconds=limit, stall_ends=False)
         result = rt.run()
     except Exception as e:
         out["why"] = f"the replay failed: {type(e).__name__}: {e}"
@@ -459,13 +464,26 @@ def replay(game, reg, project_root=None, frozen_lib=False, seconds=None, restart
                seconds=round(time.time() - started, 2), trace=trace)
     tolerance, ignore = float(spec.get("tolerance", TOLERANCE)), set(spec.get("ignore") or ())
     out["differs"] = differences(expect.get("evidence") or {}, status.get("evidence") or {}, tolerance, ignore)
+    out["stalls"] = result.get("stalls_passed") or []
+    played_on = stalls_said(out["stalls"])
     if status.get("state") != expect.get("state"):
-        out["why"] = (f"ended {status.get('state') or 'without a status'} ({result.get('reason') or ''}"
-                      f"{': ' + status['note'] if status.get('note') else ''}), not {expect.get('state')}")
+        reason = result.get("reason") or ""
+        if reason == "stalled":
+            reason = "stalled: the player stood still and the harness sent no input"
+        out["why"] = (f"ended {status.get('state') or 'without a status'} ({reason}"
+                      f"{': ' + status['note'] if status.get('note') else ''}), not {expect.get('state')}{played_on}")
         return out
     out["passed"] = True
-    out["why"] = f"ended {status.get('state')}" + (f": {status['note']}" if status.get("note") else "")
+    out["why"] = f"ended {status.get('state')}" + (f": {status['note']}" if status.get("note") else "") + played_on
     return out
+
+
+def stalls_said(stalls):
+    """The stalls a replay played on through, in words for its result ('' for none)."""
+    if not stalls:
+        return ""
+    at = ", ".join(f"t={s.get('since_t')}-{s.get('t')} s" for s in stalls)
+    return f"; played on through {len(stalls)} stall{'s' if len(stalls) > 1 else ''} (no progress at {at})"
 
 
 def try_trace(trace, n):

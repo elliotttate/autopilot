@@ -273,7 +273,7 @@ default 2: up to 3 tries) and passes on the first try that does: a claim that so
 shows it, and a game with bots doesn't always give the chance. With `--recorded` every try plays the same, so a pass
 after a failed try is reported FLAKY, which usually means its harness reads the game too tightly. It imports the project's lib.py as it is now, so a change to lib.py that breaks an old verification shows
 (`--frozen-lib`: each regression's own snapshot). `--seconds` caps each episode (default as long as the recorded one was
-allowed, else 3x the recorded one; at least 20 s). A build starts in its default map, often a menu: `--level /Game/Maps/Arena` replays a regression saved before
+allowed, else 3x the recorded one; at least 20 s). A replay plays on through a stall (no progress for a while), which in a run hands the plan back to the agent, and ends early only when the player stands still with no input sent; the result notes the stalls it played through. A build starts in its default map, often a menu: `--level /Game/Maps/Arena` replays a regression saved before
 regressions kept their level in that level. The command exits 0 when every regression passes, 1 otherwise.
 
 ## Testing a build

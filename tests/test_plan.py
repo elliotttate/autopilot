@@ -143,6 +143,35 @@ def test_a_plan_that_doesnt_advance_ends_the_episode_as_stalled(game, tmp_path):
     assert any(e["kind"] == "stalled" for e in events_of(path))
 
 
+class BusyStuckHarness(StuckHarness):
+    """Jammed as StuckHarness, but busy at it: it presses the lever's key while the player stands where it is (a
+    harness fighting in place, as a replay's capture of a point did while enemies kept coming)."""
+
+    def pull(self, game, obs):
+        for _ in range(30):  # (long enough not to be held back as an option failing at once)
+            game.press("E")
+            yield
+        return Result(False, "jammed")
+
+
+def test_a_replay_plays_on_through_a_stall_while_the_harness_is_busy(game, tmp_path):
+    path = str(tmp_path / "t.jsonl")
+    res = runtime.Runtime(game, BusyStuckHarness(), path, client=None, max_seconds=3.5, stall_ends=False).run()
+    assert res["reason"] == "time limit", res  # (not "stalled": a replay has no agent to hand the stall to)
+    assert len(res["stalls_passed"]) >= 2 and res["stalls_passed"][0]["step"] == "lever"
+    assert res["progress"]["stalled"] is None
+    assert sum(e["kind"] == "stall_passed" for e in events_of(path)) == len(res["stalls_passed"])
+    assert not any(e["kind"] == "stalled" for e in events_of(path))
+
+
+def test_a_replay_still_ends_on_a_frozen_player(game, tmp_path):
+    """No movement and no input since the watch began: nothing is happening, so the replay ends there."""
+    res = runtime.Runtime(game, StuckHarness(), str(tmp_path / "t.jsonl"), client=None, max_seconds=10,
+                          stall_ends=False).run()
+    assert res["reason"] == "stalled" and res["stalls_passed"] == [], res
+    assert res["progress"]["stalled"]["player"]["moved"] == 0
+
+
 def test_an_option_that_works_is_progress_without_a_plan(game, tmp_path):
     class NoPlan(StuckHarness):
         plan = []
