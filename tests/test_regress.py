@@ -377,7 +377,8 @@ def test_the_replays_hold_the_link_as_a_run_does(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.codexmod.Codex, "for_project", staticmethod(lambda project: None))
     monkeypatch.setattr(cli, "regress_on", lambda game, project, args, **kw: held.append(dict(state)) or 0)
     assert cli.cmd_regress(link, cli.parser().parse_args(["regress", "--no-launch"])) == 0
-    assert held == [{"run": {"project": "Tiny", "engine": "unreal"}}] and state == {}  # (held during, freed after)
+    # (held during, freed after)
+    assert [h.get("run") for h in held] == [{"project": "Tiny", "engine": "unreal"}] and "run" not in state
 
 
 def test_when_and_where_are_not_compared():

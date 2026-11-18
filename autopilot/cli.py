@@ -1630,8 +1630,8 @@ def parser():
     r.add_argument("--aura", action="store_true",
                    help="sign in with Aura: run on your Aura plan instead of your own keys")
     rg = sub.add_parser("regress", help="replay the regressions (harnesses of CONFIRMED claims), the decision model "
-                                        "deciding in play (no agent): starts the game headless (--project), a build of it (--build), or waits for "
-                                        "the editor (--no-launch)")
+                                        "deciding in play (no agent): starts the game headless (--project), a build "
+                                        "of it (--build), or waits for the editor (--no-launch)")
     rg.add_argument("--project", dest="path", help=project_help)
     rg.add_argument("--build", help="a built game to replay them on, with no editor and no project: an Unreal "
                                     "packaged game, a Unity player or a Godot export (a Development build, which "

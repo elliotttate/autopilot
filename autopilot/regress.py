@@ -360,8 +360,9 @@ def by_class(text):
 def differences(expected, got, tolerance=TOLERANCE, ignore=(), at=""):
     """What changed in a replay's evidence from the recording's, as "key: then, now" lines: shown with the result,
     never a failure (the harness's done is the claim; the rest varies with play: rounds left, who holds an objective
-    at the end). Booleans, strings (object names by class: by_class) and None when they differ; numbers when they moved by
-    more than tolerance (relative, at least of 1); lists when their length changed; keys there then and missing now.
+    at the end). Booleans, strings (object names by class: by_class) and None when they differ; numbers when they
+    moved by more than tolerance (relative, at least of 1); lists when their length changed; keys there then and
+    missing now.
     When and where (incidental keys) and the keys in ignore (a regression's own "ignore") are left out."""
     out = []
     where = at or "value"
