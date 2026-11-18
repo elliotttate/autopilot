@@ -171,6 +171,23 @@ def test_a_reset_memory_is_reset_in_aura_too_its_files_kept_aside_never_deleted(
     assert storage.sync().save(a) == (1, 0) and storage.files["notes.md"] == b"learned again"
 
 
+def test_a_regression_removed_before_a_reset_stays_removed(storage, tmp_path):
+    """A reset leaves the regressions; one the person deleted before it is still a deletion, never fetched back."""
+    a = str(tmp_path / "a")
+    write(a, "notes.md", "n")
+    write(a, "regressions/old/regression.json", "{}")
+    write(a, "regressions/kept/regression.json", "{}")
+    assert storage.sync().save(a) == (3, 0)
+    os.remove(os.path.join(a, "regressions", "old", "regression.json"))  # (deleted with no run since)
+    memory.forget(a)
+    storage.sync().restore(a)  # (the next run: the reset is passed on first)
+    assert not os.path.exists(os.path.join(a, "regressions", "old", "regression.json"))
+    assert read(a, "regressions/kept/regression.json") == "{}"
+    assert storage.sync().save(a) == (0, 1)
+    assert "regressions/old/regression.json" not in storage.files
+    assert "regressions/kept/regression.json" in storage.files
+
+
 def test_runs_with_own_keys_keep_their_own_copy_and_a_reset_reaches_both_copies(storage, tmp_path):
     """Runs with the user's own keys keep the memory with Aura for this install (when shared); a Reset memory reaches
     the team's copy and the install's, each at its next save, whichever comes first."""

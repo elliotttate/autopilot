@@ -400,7 +400,10 @@ class MemorySync:
         reset_id = self._send_reset_id()
         mark["passed"] = [*(mark.get("passed") or []), self.copy]
         memory.write_atomic(path, json.dumps(mark))
-        _write_baseline(folder, {}, self.sync_file, reset=reset_id)  # (nothing learned is synced now)
+        # Nothing learned is synced now; what a reset leaves (regressions) stays agreed on, so one removed here before
+        # the reset is still taken as removed here, and never fetched back.
+        kept = {p: m for p, m in _read_baseline(folder, self.sync_file).items() if not is_learned(p)}
+        _write_baseline(folder, kept, self.sync_file, reset=reset_id)
         print(f"Memory reset with Aura too: {moved} files kept aside")
         return moved
 
