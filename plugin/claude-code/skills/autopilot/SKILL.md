@@ -53,6 +53,38 @@ Autopilot plays up to three games side by side in the editor (Unreal), one run i
 - When every run has reported, tell the user each request's outcome in one line, in their order (a table when they
   gave a table).
 
+## Several verifications in one game, one after another
+
+The other way through a list of verifications: one run after another in one game, which stays open between them
+(no game torn down and started again for each request). Use it when the user asks for it (one window, one game,
+one after another, "don't restart the game between them"), and in editors that play one game at a time (Unity,
+Godot, Roblox Studio).
+
+- You choose the order: put requests that build on the same state next to each other (verify reloading right after
+  firing, a building's roof after entering it), and the ones that change the game for good (dying, using up a
+  resource) late.
+- Work through them yourself, one run at a time: `start_run` with `kind` verify and `keep_game_open` true for every
+  request but the last, steps 3-7 for it, then the next `start_run`. Read INSTRUCTIONS.md once, for the first run;
+  the next runs' instructions are the same.
+- Every run reports its own verdict with `report`, as one run alone would: never settle a request yourself without
+  its run, and never report one run's verdict for another request. Each run's id is its own: pass it as `run`.
+- When a run has reported, its game stays open, paused where the run left it, and the next run plays on in it. Its
+  briefing shows the game as it is now; its first `run_harness` may go on from there with `restart=False` when that
+  suits its request, or restart. Restarts reopen the level in the game playing: in Roblox Studio they respawn the
+  player and keep what the world changed.
+- The game closes when the last run (the one without `keep_game_open`) reports, or when no run has come for 10
+  minutes.
+
+## Headless
+
+When the user asks for Autopilot headless (no window, no editor), pass `headless` true with every `start_run`:
+Autopilot starts the project's game itself with no window (Unreal, Unity, Godot; not Roblox, whose games play only
+in Roblox Studio) and plays every headless run in that one game, one after another, as above (no `keep_game_open`
+needed). `project` names the game's project when it isn't the one in your working folder. The first start takes a
+while (the game starts; say so to the user). A headless game draws no picture: settle requests from the game's
+state, and a request about how something looks is INCONCLUSIVE there (tell the user it needs the editor). Unity opens
+a project in one editor at a time: a headless Unity game needs the project closed in the Unity editor.
+
 Use Autopilot's own file tools for the game's folder (paths relative to it), never your own, and don't change the
 user's project or the game's files: the game is acted on only through play, with Autopilot's tools. The user can
 watch the run in the Autopilot tab, stop it there, or steer it; what they type there reaches you with your next tool
