@@ -220,6 +220,13 @@ The processes are watched on threads of their own: nothing waits on the editor's
    levels before it starts playing. That level plays without being opened in the editor (the play session's map
    override): the open level and its unsaved changes stay as they are.
 
+   Before it starts Play In Editor, the plugin compiles the blueprints that changed since they last compiled, as
+   Play does (when the Play settings' Auto Recompile Blueprints is on). If any blueprint has compile errors, the game
+   isn't started and the run ends at once: its result names each broken blueprint with the compiler's errors, so you
+   can fix them and run again. A game with broken blueprints would play something else than they say, and the
+   engine's dialog asking whether to play anyway would hold the run. To play with them all the same, press Play once
+   and choose to play anyway: runs then play with them too, until they compile again.
+
 While a run is going, the tab shows:
 
 - **Live**: the stages of the run (Launch, Analyze, Probe env, Build harness, Rollout · H*n*, Process result, Report;
@@ -640,7 +647,7 @@ The plugin has three modules:
 | `Private/PlaytestOps.h` | declarations shared by the request handlers below: every `op` the agent service sends, one file per family |
 | `Private/PlaytestOps.cpp` | `Handle`, which routes each request to its op's handler, and small helpers the handlers share |
 | `Private/PlaytestOpsRc.cpp` | `rc`: Remote Control compatible calls, property reads and writes, descriptions |
-| `Private/PlaytestOpsSession.cpp` | `context`, `session` (start, stop, restart; in the `map` asked for), `levels`, `pause`, `timestep`, `ping` |
+| `Private/PlaytestOpsSession.cpp` | `context`, `session` (start, stop, restart; in the `map` asked for; 412 with the editor's `StartProblem`, blueprints with compile errors, before anything changes), `levels`, `pause`, `timestep`, `ping` |
 | `Public/PlaytestLevels.h`, `Private/PlaytestLevels.cpp` | the project's levels, and the one a run asks for by path or name (Play In Editor's map override) |
 | `Private/PlaytestOpsInput.cpp` | `input`, `move`, `key`: input actions, movement, and keys held between frames |
 | `Private/PlaytestRunInput.cpp` | while a run plays: your own keyboard, mouse and gamepads held off the game, and the mouse not taken by its view |

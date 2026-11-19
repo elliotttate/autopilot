@@ -237,9 +237,45 @@ def choose_level(link, asked=None):
     return level
 
 
+class GameWontStart(Exception):
+    """The game refused to start: the plugin answered the session start 412 (Unreal: blueprints with compile errors,
+    each with the compiler's errors). A run on it would play another game than the one its blueprints describe, so it
+    ends at once and tells the user why (wont_start_report)."""
+
+
+def refused(e):
+    """A GameWontStart for a session start's error the game refused it with (412: a precondition of playing failed),
+    else None. (Not 409: Aura's relay answers a failed start that way, a level the project hasn't among them.)"""
+    if getattr(e, "status", None) == 412:
+        return GameWontStart(str(getattr(e, "error", None) or e))
+    return None
+
+
+class EndsIfGameWontStart:
+    """Around a run's setup: a GameWontStart ends it there (kept in .error, the run's report: wont_start_report)."""
+
+    error = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, e, tb):
+        if isinstance(e, GameWontStart):
+            self.error = e
+            return True
+        return False
+
+
+def wont_start_report(kind, e):
+    """The report of a run that ended because the game wouldn't start (GameWontStart): why, said as an alert too."""
+    why = str(e)
+    return {"outcome": "INCONCLUSIVE" if kind == "verify" else "not_achieved", "summary": why, "evidence": [],
+            "alerts": [why]}
+
+
 def start_level(link, game, level):
     """Start the game (when it isn't running) in the level chosen (choose_level); a level that can't be played
-    leaves the game in the editor's own (level.failed says why)."""
+    leaves the game in the editor's own (level.failed says why). A game that refuses to start raises GameWontStart."""
     running = bool(link.request("session", {"action": "status"}).get("running"))
     if level.asked and not level.failed:
         if running and levelsmod.same(level.playing, level.asked):
@@ -251,6 +287,8 @@ def start_level(link, game, level):
                              timeout=60)
                 level.playing_asked = True
             except Exception as e:
+                if refused(e):
+                    raise refused(e) from e
                 level.failed = str(getattr(e, "error", None) or e)
                 print(f"note: couldn't play {level.asked}: {level.failed}")
                 running = bool(link.request("session", {"action": "status"}).get("running"))
@@ -259,7 +297,12 @@ def start_level(link, game, level):
             level.playing = level.asked
     if not running and not level.playing_asked:
         link.status("Starting the game")
-        link.request("session", {"action": "start"}, timeout=60)
+        try:
+            link.request("session", {"action": "start"}, timeout=60)
+        except Exception as e:
+            if refused(e):
+                raise refused(e) from e
+            raise
     if not level.playing_asked:
         level.playing = level.playing or level.open
 
@@ -315,6 +358,8 @@ def prepare(link, path=None, level=None):
     game.level_info = choose_level(link, level)
     try:
         start_level(link, game, game.level_info)
+    except GameWontStart:
+        raise
     except Exception as e:
         print(f"note: couldn't start the session: {e}")
     if game.level_info.playing_asked:
@@ -726,7 +771,9 @@ def run_prompt(link, prompt, path=None, model=None, timeout=None, stop=None, sen
             account.note_credits(e.message)
             credits_refused = True
     else:
-        with run or contextlib.nullcontext(), contextlib.ExitStack() as setup:
+        # (a game that won't start ends the run in its setup: Aura's run is finished all the same)
+        ends = EndsIfGameWontStart()
+        with ends, run or contextlib.nullcontext(), contextlib.ExitStack() as setup:
             if not kind:
                 kind, tested = told_kind(link, prompt)
             asked, play_seconds = settle()
@@ -791,6 +838,8 @@ def run_prompt(link, prompt, path=None, model=None, timeout=None, stop=None, sen
             close_game(link)  # (every harness has run, and the recording has stopped)
             if share:
                 upload = (root, project if run else key, run)
+        if ends.error is not None:
+            report = wont_start_report(kind, ends.error)
     print(json.dumps(report, indent=1))
     LAST_REPORT.clear()
     LAST_REPORT.update(report if isinstance(report, dict) else {})

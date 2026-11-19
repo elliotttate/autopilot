@@ -213,6 +213,11 @@ public:
 	/** Set by the editor module: whether a play session has been asked for and hasn't started yet. */
 	TFunction<bool()> SessionRequested;
 
+	/** Set by the editor module: why Play In Editor shouldn't start now (blueprints with compile errors, with the
+	 *  compiler's errors), "" when it can. A session start or restart that would start it answers 412 with it, before
+	 *  anything changes, instead of the engine's dialog asking whether to play anyway. */
+	TFunction<FString()> StartProblem;
+
 	/** The map the game was launched with: the long package name of the first game world seen begin play (no PIE prefix), ""
 	 *  before one. A game build's restart reopens it, not the map the game has travelled to since (a match that ended
 	 *  moves the server to the next map of its rotation). */
@@ -372,6 +377,7 @@ private:
 	/** The tests' socket: what Send would send, written out, instead (AutopilotPanelTests.cpp). */
 	TFunction<void(const FString&)> TestSent;
 	friend class FAutopilotDetectorsSwitchTest;  // (feeds a subsystem of its own memory_state, flips the switch: AutopilotPanelTests.cpp)
+	friend class FAutopilotBlueprintErrorsTest;  // (asks a subsystem of its own for a session start: BlueprintErrorsTests.cpp)
 	double NextReconnect = 0;
 	double Backoff = 1.0;
 	double LastHeartbeat = 0;
