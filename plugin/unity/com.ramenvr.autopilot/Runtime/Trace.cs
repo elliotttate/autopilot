@@ -38,7 +38,7 @@ namespace Autopilot.Playtest
             {
                 mask = 0;
                 for (var i = 0; i < 32; ++i)
-                    if (!Physics.GetIgnoreLayerCollision(player.layer, i))
+                    if (!Physics.GetIgnoreLayerCollision(Player.Layer(player), i))
                         mask |= 1 << i;
                 mask &= ~(1 << 2);  // (never Ignore Raycast)
             }

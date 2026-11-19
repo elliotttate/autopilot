@@ -354,8 +354,9 @@ namespace Autopilot.Playtest
             foreach (var go in Characters())
             {
                 if (go == null || !alive.Add(go)) continue;
-                if (!tracks.TryGetValue(go, out var track)) tracks[go] = track = new Track { At = go.transform.position };
-                var at = go.transform.position;
+                // (the player's body may hang beneath the object named as the player: Player.Position)
+                var at = go == Player.Find() ? Player.Position(go) : go.transform.position;
+                if (!tracks.TryGetValue(go, out var track)) tracks[go] = track = new Track { At = at };
                 if (track.Frames > 5 && !agentMoved)
                 {
                     var speed = (double)Player.Velocity(go).magnitude;

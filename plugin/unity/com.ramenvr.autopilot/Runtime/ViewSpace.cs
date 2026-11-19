@@ -205,7 +205,7 @@ namespace Autopilot.Playtest
                 probe.WalkableZ = Mathf.Cos(cc.slopeLimit * Mathf.Deg2Rad);
             }
             // (what its layer collides with: Physics settings' layer collision matrix)
-            var layer = player.layer;
+            var layer = Autopilot.Playtest.Player.Layer(player);
             var mask = 0;
             for (var i = 0; i < 32; ++i)
                 if (!Physics.GetIgnoreLayerCollision(layer, i))

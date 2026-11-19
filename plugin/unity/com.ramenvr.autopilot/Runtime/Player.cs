@@ -24,6 +24,67 @@ namespace Autopilot.Playtest
             cachedFrame = -1;
         }
 
+#if AUTOPILOT_PHYSICS
+        static GameObject capsuleOwner;
+        static CapsuleCollider capsule;
+        static int capsuleFrame = -1;
+
+        /// <summary>The body's capsule, for a player without a CharacterController: the player object's own, else the
+        /// tallest upright solid capsule beneath it. A rig often keeps its colliders on a child (Opsive's character
+        /// controller does), and a harness may name a whole rig as the player so that nothing of it is ever taken for
+        /// the room: either way the body is that capsule, wherever under the player it hangs.</summary>
+        public static CapsuleCollider Capsule(GameObject player)
+        {
+            if (player == null) return null;
+            if (capsuleOwner == player)
+            {
+                if (capsule != null && capsule.enabled && capsule.gameObject.activeInHierarchy) return capsule;
+                if (capsuleFrame == Time.frameCount) return null;  // (looked for this frame already: there is none)
+            }
+            capsuleOwner = player;
+            capsuleFrame = Time.frameCount;
+            capsule = player.GetComponent<CapsuleCollider>();
+            if (capsule != null && capsule.enabled) return capsule;
+            capsule = null;
+            var tallest = 0f;
+            foreach (var c in player.GetComponentsInChildren<CapsuleCollider>())
+            {
+                if (c == null || !c.enabled || c.isTrigger || c.direction != 1) continue;  // (upright: along its own y)
+                var height = Mathf.Max(c.height, 2f * c.radius) * Mathf.Abs(c.transform.lossyScale.y);
+                if (height <= tallest) continue;
+                tallest = height;
+                capsule = c;
+            }
+            return capsule;
+        }
+#endif
+
+        /// <summary>Where the body is: its capsule's object when that hangs beneath the player, else the player.</summary>
+        public static Vector3 Position(GameObject player)
+        {
+#if AUTOPILOT_PHYSICS
+            if (player.GetComponent<CharacterController>() == null)
+            {
+                var body = Capsule(player);
+                if (body != null && body.gameObject != player) return body.transform.position;
+            }
+#endif
+            return player.transform.position;
+        }
+
+        /// <summary>The layer the body collides on: its capsule's when that hangs beneath the player.</summary>
+        public static int Layer(GameObject player)
+        {
+#if AUTOPILOT_PHYSICS
+            if (player.GetComponent<CharacterController>() == null)
+            {
+                var body = Capsule(player);
+                if (body != null) return body.gameObject.layer;
+            }
+#endif
+            return player.layer;
+        }
+
         public static GameObject Find()
         {
             if (cachedFrame == Time.frameCount && cached != null) return cached;
@@ -124,13 +185,13 @@ namespace Autopilot.Playtest
                 radius = cc.radius * Mathf.Max(Mathf.Abs(s.x), Mathf.Abs(s.z));
                 return player.transform.TransformPoint(cc.center);
             }
-            var capsule = player.GetComponent<CapsuleCollider>();
-            if (capsule != null)
+            var body = Capsule(player);
+            if (body != null)
             {
-                var s = player.transform.lossyScale;
-                halfHeight = capsule.height * 0.5f * Mathf.Abs(s.y);
-                radius = capsule.radius * Mathf.Max(Mathf.Abs(s.x), Mathf.Abs(s.z));
-                return player.transform.TransformPoint(capsule.center);
+                var s = body.transform.lossyScale;
+                radius = body.radius * Mathf.Max(Mathf.Abs(s.x), Mathf.Abs(s.z));
+                halfHeight = Mathf.Max(body.height * 0.5f * Mathf.Abs(s.y), radius);
+                return body.transform.TransformPoint(body.center);
             }
 #endif
             return player.transform.position;
@@ -147,13 +208,20 @@ namespace Autopilot.Playtest
             var cc = player.GetComponent<CharacterController>();
             if (cc != null && cc.enabled) return cc.velocity;
             var rb = player.GetComponent<Rigidbody>();
-            if (rb != null) return rb.linearVelocity;
+            if (rb == null)
+            {
+                var body = Capsule(player);
+                if (body != null) rb = body.attachedRigidbody;
+            }
+            // (a kinematic body is moved by its script: its Rigidbody's velocity says nothing)
+            if (rb != null && !rb.isKinematic) return rb.linearVelocity;
 #endif
             // From where it was at an earlier frame
             var now = Time.timeAsDouble;
+            var at = Position(player);
             if (lastPosOf == player && lastPosTime >= 0 && now - lastPosTime > 1e-4)
-                trackedVelocity = (player.transform.position - lastPos) / (float)(now - lastPosTime);
-            lastPos = player.transform.position;
+                trackedVelocity = (at - lastPos) / (float)(now - lastPosTime);
+            lastPos = at;
             lastPosTime = now;
             lastPosOf = player;
             return trackedVelocity;
@@ -192,7 +260,7 @@ namespace Autopilot.Playtest
                 if (cc.isGrounded) return true;
                 return StandingOn(player, out _, out _) != null;
             }
-            if (player.GetComponent<Collider>() != null)
+            if (player.GetComponent<Collider>() != null || Capsule(player) != null)
                 return StandingOn(player, out _, out _) != null;
 #endif
             return null;
@@ -340,12 +408,12 @@ namespace Autopilot.Playtest
                 slope = Json.Round(cc.slopeLimit, 1);
                 sources["shape"] = Paths.Of(cc);
             }
-            else if (player.GetComponent<CapsuleCollider>() != null)
+            else if (Capsule(player) != null)
             {
                 Center(player, out var hh, out var r);
                 half = Json.Round(hh * Frame.Scale, 1);
                 radius = Json.Round(r * Frame.Scale, 1);
-                sources["shape"] = Paths.Of(player.GetComponent<CapsuleCollider>());
+                sources["shape"] = Paths.Of(Capsule(player));
             }
 #endif
             return new Dictionary<string, object>
