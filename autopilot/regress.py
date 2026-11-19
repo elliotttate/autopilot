@@ -293,6 +293,8 @@ class ReplayJev:
     option offered that the recording picked most, else the first offered. Other questions get the recorded answers
     of the same decision, else neutral ones. No model is called."""
 
+    decision_provider = "recorded"
+
     def __init__(self, picks, extras=None):
         self.picks = list(picks or [])
         self.extras = list(extras or [])

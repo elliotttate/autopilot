@@ -83,15 +83,20 @@ PACKAGE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the aut
 KIT_DOC = os.path.join(PACKAGE, "KIT.md")
 HARNESS_DOC = os.path.join(PACKAGE, "kit", "harness.py")
 
-SYSTEM = """You write the harness that lets Jev, a fast decision model, play a video game made in {engine}. You are
-inside the game's editor plugin: you can read the game's code (its codex) and act on the live game through tools.
-
-Jev answers typed questions in ~0.1-0.3 s: given a state (JSON facts) it picks one of a set of options, with
+JEV_GUIDANCE = """Jev answers typed questions in ~0.1-0.3 s: given a state (JSON facts) it picks one option, with
 probabilities. People made Jev play Doom (monsters as distance + bearing; ATTACK/TURN_LEFT/TURN_RIGHT at 7 Hz),
 Tetris (it ranks every legal placement, described in words), Pac-Man (one block of facts per legal direction at each
 junction) and Flappy Bird (FLAP/WAIT 20 times a second) by writing a harness by hand: code computes the facts and the
-legal options and executes the chosen option; Jev decides. You write that harness, for this game and this request,
-from the game's code and from what you see it do.
+legal options and executes the chosen option; Jev decides."""
+
+CODEX_GUIDANCE = """The decision model is the player's signed-in Codex CLI. Each choice can take several seconds.
+Ask for strategic choices such as which visible aisle or doorway to take. Keep collision checks, time-sensitive
+inputs and movement in local option executors. Confirm that each completed choice is still feasible before acting."""
+
+SYSTEM = """You write a harness for a decision model playing a video game made in {engine}. You are
+inside the game's editor plugin: you can read the game's code (its codex) and act on the live game through tools.
+
+{decision_guidance}
 
 Your working directory is this game's folder:
   codex/       the game's code and data as text (start with codex/README.md; level.txt is the level running now)
@@ -397,6 +402,9 @@ def unknown_args(tool, args, specs=TOOL_SPECS):
 def model(provider="anthropic"):
     """The agent's language model for this run: AUTOPILOT_MODEL, else the provider's (MODELS; Anthropic's for
     another)."""
+    if provider == "codex":
+        return (os.environ.get("AUTOPILOT_CODEX_MODEL") or os.environ.get("AUTOPILOT_MODEL") or
+                "Codex CLI default").strip()
     return (os.environ.get("AUTOPILOT_MODEL") or "").strip() or MODELS.get(provider) or MODELS["anthropic"]
 
 
@@ -468,7 +476,12 @@ def research_doc():
 def system_prompt(engine, run_rel, agents=""):
     """The instructions. agents: what this agent's subagents are and when to use them (the Claude Code agent's
     researchers), as a paragraph of step 1; "" for an agent that has none."""
-    return (SYSTEM.replace("{engine}", engine.title).replace("{run}", run_rel).replace("{kit}", kit_doc(engine))
+    from .. import codex_login
+
+    text = SYSTEM.replace("Jev", "the decision model") if codex_login.active() else SYSTEM
+    guidance = CODEX_GUIDANCE if codex_login.active() else JEV_GUIDANCE
+    return (text.replace("{decision_guidance}", guidance).replace("{engine}", engine.title)
+            .replace("{run}", run_rel).replace("{kit}", kit_doc(engine))
             .replace("{research}", research_doc()).replace("{agents}", (" " + agents.strip()) if agents else "")
             .replace("{probe_seconds:.0f}", f"{PROBE_SECONDS:.0f}")
             .replace("{research_minutes:g}", f"{research_seconds() / 60:g}")

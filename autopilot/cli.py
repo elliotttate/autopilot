@@ -54,6 +54,7 @@ from . import (
     aura_login,
     aura_memory,
     bridge,
+    codex_login,
     engines,
     memory,
     processes,
@@ -487,11 +488,12 @@ def classify(prompt, client=None):
         answer = client.system_one(state={"request": prompt.strip()},
                                    questions={"kind": runtime.Choice(instructions=KIND_INSTRUCTIONS,
                                                                      criteria=KIND_CRITERIA)},
-                                   timeout=KIND_TIMEOUT,
+                                   timeout=45 if codex_login.active() else KIND_TIMEOUT,
                                    retry=runtime.RetryPolicy(max_retries=1, backoff_initial=0.2, timeout=KIND_TIMEOUT))
         picked = answer.choices["kind"].choice
     except Exception as e:
-        print(f"note: Jev couldn't read the prompt's kind ({type(e).__name__}: {e}); its first words decide")
+        print(f"note: the decision model couldn't classify the request ({type(e).__name__}: {e}); "
+              "using its first words")
         return kind_by_words(prompt), False
     if picked == "test":
         return "explore", True
@@ -589,7 +591,7 @@ def describer_model(run, provider):
     run (or its free part: run.vision), else Aura's Claude (vision.MODEL through its Anthropic relay), whatever the
     agent plays; with the user's own keys, a model of the agent's provider."""
     if run is None:
-        return provider, None
+        return ("codex" if codex_login.active() else provider), None
     if run.vision:
         return run.vision["provider"], run.vision["model"]
     return "anthropic", None
@@ -1098,7 +1100,10 @@ def replay_decisions(link, project, live):
     if not live:
         yield None
         return
-    if not aura.enabled() and not (os.environ.get("TYPESAFE_API_KEY") or "").strip():
+    if codex_login.active():
+        if problem := codex_login.unavailable():
+            raise NoDecisions(problem)
+    elif not aura.enabled() and not (os.environ.get("TYPESAFE_API_KEY") or "").strip():
         raise NoDecisions(
             "Replaying with live decisions needs Autopilot's decision model: sign in to Aura (`autopilot login`, then "
             "replay with --aura) or add the line TYPESAFE_API_KEY=<the key> (https://typesafe.ai) to "
@@ -1281,6 +1286,8 @@ def launch_headless(args, url, say=print):
 def decision_key_missing():
     """Why a run with the user's own keys can't start (its decision model has no key; a run through Aura needs none),
     or None. Told to the user's own agent (`autopilot mcp`): the key goes in the file, never into its conversation."""
+    if codex_login.active():
+        return codex_login.unavailable()
     if aura.enabled() or (os.environ.get("TYPESAFE_API_KEY") or "").strip():
         return None
     return ("Autopilot needs a key for its decision model, the one that plays the game (TypeSafe: "
@@ -1694,6 +1701,8 @@ def parser():
                                         "frame describer (autopilot/connect.py)")
     co.add_argument("client", choices=("claude", "codex"))
     co.add_argument("--remove", action="store_true", help="take out what connect set up")
+    co.add_argument("--use-chatgpt", action="store_true",
+                    help="use your signed-in Codex CLI for playtest planning, gameplay decisions, and frame analysis")
     from . import evolve as evolvemod  # (autopilot/evolve.py: its own options)
 
     evolvemod.add_parser(sub)
@@ -1748,6 +1757,19 @@ def main(argv=None):
     if args.cmd == "connect":
         from . import connect
 
+        if args.use_chatgpt:
+            if args.client != "codex" or args.remove:
+                raise SystemExit("--use-chatgpt is available with autopilot connect codex")
+            if problem := codex_login.unavailable():
+                raise SystemExit(problem)
+            share = account.preferences().get("share_data", False)
+            ok, reason = account.save_setup({"access": "own_keys", "coding_agent": "codex", "share": share})
+            if not ok:
+                raise SystemExit(reason)
+            account._set_env_lines(account._user_env_path(), {"AUTOPILOT_DECISION_PROVIDER": "codex"})
+            load_user_keys()
+            account.follow_preferences()
+            print("Playtest planning and decisions will use your Codex CLI ChatGPT login.")
         return (connect.disconnect if args.remove else connect.connect)(args.client)
 
     # The agent service takes runs from the user's own Claude Code or Codex too (`autopilot mcp` finds it by brain.json)

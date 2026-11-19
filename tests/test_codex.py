@@ -157,7 +157,7 @@ def test_the_mcp_server_lists_the_tools_and_passes_calls_on(root):
 
 def test_codex_is_locked_down_and_says_no_to_what_it_asks(monkeypatch, tmp_path):
     config = codexagent.thread_config("C:/run/home/autopilot-tools.json", 1800, "http://127.0.0.1:9/proxy/openai/")
-    for key in ("features.shell_tool", "features.unified_exec", "features.view_image", "agents.enabled"):
+    for key in ("features.shell_tool", "features.unified_exec", "features.view_image", "features.multi_agent"):
         assert config[key] is False, key
     assert config["web_search"] == "disabled" and config["project_doc_max_bytes"] == 0
     assert config["openai_base_url"] == "http://127.0.0.1:9/proxy/openai"

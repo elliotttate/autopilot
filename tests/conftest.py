@@ -61,7 +61,10 @@ def no_user_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "load_user_keys", lambda: None)
     monkeypatch.setattr(account, "_user_env_path", lambda: str(tmp_path / "autopilot.env"))
     monkeypatch.setattr(account, "_from_user_env", {})
-    for name in ("AUTOPILOT_AURA_SERVER", "AUTOPILOT_AGENT", "AUTOPILOT_OPENCODE_PROVIDER", "AUTOPILOT_MODEL"):
+    # A test that chooses the Aura relay sets its URL inside application code. Start each test with its own
+    # provider selection, including when a previous test began with no URL for monkeypatch to restore.
+    for name in ("AUTOPILOT_AURA_URL", "AUTOPILOT_AURA_SERVER", "AUTOPILOT_AGENT", "AUTOPILOT_OPENCODE_PROVIDER",
+                 "AUTOPILOT_DECISION_PROVIDER", "AUTOPILOT_MODEL"):
         monkeypatch.delenv(name, raising=False)
 
 

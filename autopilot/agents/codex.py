@@ -1,4 +1,8 @@
-"""The agent on Codex (OpenAI's coding agent, through its Python SDK, openai-codex). AUTOPILOT_AGENT=codex picks it.
+"""The Codex coding agent. AUTOPILOT_AGENT=codex selects it.
+
+With AUTOPILOT_DECISION_PROVIDER=codex, the installed CLI authenticates with its existing ChatGPT login. It runs
+ephemeral turns in a temporary workspace using this playtest's MCP server, with user configuration and shell disabled.
+The API-key path below uses the Codex Python SDK.
 
 It gets the same request, instructions, briefing and game tools as Claude Code and OpenCode; only the agent differs.
 The SDK runs Codex as `codex app-server`; the game's tools reach it as an MCP server on stdio (codex_tools.py) that
@@ -8,8 +12,8 @@ Codex's own tools are cut to what can't reach outside the game's folder: its she
 viewing and sleep are off; its sandbox is read-only (its patch tool is refused); it is never asked to approve anything,
 and a request it makes anyway is declined (decline()). It reads and writes files through Autopilot's file tools
 (files.py), held to the game's folder as OpenCode's are: read the folder and the kit; write this run's folder, notes.md
-and lib.py. Every run gets a temporary Codex home, so the user's own Codex setup (config, AGENTS.md, skills, sign-in) is
-never loaded and a run doesn't depend on what earlier runs left.
+and lib.py. Each SDK run gets a temporary Codex home. It starts independently of earlier runs and the user's local
+configuration, AGENTS.md, skills and sign-in.
 
 OpenAI only: the key is OPENAI_API_KEY (or CODEX_API_KEY), the model AUTOPILOT_MODEL, else OpenAI's default
 (session.MODELS); it must be one Codex knows (it offers no tools to others). Installed with the codex extra
@@ -24,7 +28,7 @@ import threading
 import time
 import traceback
 
-from .. import engines
+from .. import codex_login, engines
 from . import session as sessionmod
 from .files import FILE_TOOL_SPECS
 from .opencode import remove_tree
@@ -44,7 +48,9 @@ LOCKDOWN = {
     "features.view_image": False,
     "features.sleep_tool": False,
     "features.multi_agent_v2": False,
-    "agents.enabled": False,
+    # Sub-agents. Codex CLI 0.144 reads `agents` as a table of agent roles and refuses to start on
+    # `agents.enabled` ("expected struct AgentRoleToml"); the switch is the multi_agent feature.
+    "features.multi_agent": False,
     "features.collaboration_modes": False,
     "tools.experimental_request_user_input.enabled": False,
     "features.memories": False,
@@ -231,25 +237,51 @@ def run_turns(thread, message, events, session, deadline, effort):
     return None
 
 
+def chatgpt_turns(session, spec, work, message, events, model):
+    """The CLI reuses its own ChatGPT sign-in and sees only this run's game tools."""
+    config = thread_config(spec, session.budget)
+    config["developer_instructions"] = system_text(engines.of(session.game), session.run_rel)
+    deadline = time.monotonic() + session.budget
+    while message:
+        try:
+            text = codex_login.ask(message, timeout=max(0.1, deadline - time.monotonic()), stop=session.stop,
+                                   config=config, model=model, cwd=work)
+        except InterruptedError:
+            return "stopped"
+        except TimeoutError:
+            return "timed out"
+        events.event("item/completed", {"item": {"type": "agentMessage", "text": text}})
+        message = session.next_message()
+        if message:
+            message = (f"Continue the playtest in {session.run_rel}. Your last response was:\n{text}\n"
+                       f"The player added:\n{message}")
+    return None
+
+
 def implement(game, project, prompt, run_id=None, say=None, client=None, model=None, timeout=None, stop=None,
               steering=None, play_seconds=None, describer=None, activity=None):
     """Research, write, run and revise a harness for prompt on the live game; returns the report. The same arguments
     and report as autopilot.agents.claude_code.implement (the report says "agent": "codex")."""
-    try:
-        from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
-        from openai_codex.types import ReasoningEffort
-    except ImportError:
-        raise RuntimeError("The Codex agent needs Codex: install Autopilot with the codex extra "
-                           "(`autopilot[codex]`), or pick another agent with AUTOPILOT_AGENT.") from None
-    key = api_key()
-    if not key:
-        raise RuntimeError("The Codex agent needs an OpenAI key: set OPENAI_API_KEY (the first-run setup saves it "
-                           "when OpenAI is picked).")
-    model = model or sessionmod.model(PROVIDER)
+    chatgpt = codex_login.active()
+    if chatgpt:
+        if problem := codex_login.unavailable():
+            raise RuntimeError(problem)
+        model = model or os.environ.get("AUTOPILOT_CODEX_MODEL") or os.environ.get("AUTOPILOT_MODEL") or None
+    else:
+        try:
+            from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
+            from openai_codex.types import ReasoningEffort
+        except ImportError:
+            raise RuntimeError("Install Autopilot with the codex extra to use the OpenAI API coding agent.") from None
+        key = api_key()
+        if not key:
+            raise RuntimeError("The Codex agent needs an OpenAI key: set OPENAI_API_KEY or select the signed-in "
+                               "Codex provider (AUTOPILOT_DECISION_PROVIDER=codex).")
+        model = model or sessionmod.model(PROVIDER)
     session = sessionmod.open_session(game, project, prompt, run_id, say=say, client=client, timeout=timeout,
                                       stop=stop, steering=steering, play_seconds=play_seconds,
                                       describer=describer, activity=activity)
-    session.note(f"agent: Codex (openai-codex), {PROVIDER} {model}")
+    session.note(f"agent: Codex ({'ChatGPT login' if chatgpt else 'OpenAI API'}), {model or 'CLI default'}")
     work = tempfile.mkdtemp(prefix="autopilot-codex-")  # (Codex's own home for this run: not in the game's memory)
     home = os.path.join(work, "home")
     os.makedirs(home)
@@ -258,8 +290,6 @@ def implement(game, project, prompt, run_id=None, say=None, client=None, model=N
     with open(spec, "w", encoding="utf-8") as f:
         json.dump({"url": server.url, "tools": mcp_tools()}, f)
     events = Events(session, say=session.say)
-    level = sessionmod.effort(model)
-    effort = ReasoningEffort(level) if level in {e.value for e in ReasoningEffort} else None
     message = sessionmod.first_message(session)
 
     done = sessionmod.watch_steering(session)
@@ -267,18 +297,23 @@ def implement(game, project, prompt, run_id=None, say=None, client=None, model=N
     stopped = None
     try:
         game.pause(True)  # (in the try: a game that doesn't answer still gets cleaned up and reported)
-        with Codex(CodexConfig(env=app_env(home, work), cwd=session.root)) as codex:
-            codex._client._approval_handler = decline  # (the SDK's own accepts commands and file changes)
-            codex.login_api_key(key)
-            known = known_models(codex)
-            if known is not None and model not in known:
-                raise RuntimeError(f"Codex doesn't know the model {model!r} (it offers no tools to models it doesn't "
-                                   f"know): set AUTOPILOT_MODEL to one of {', '.join(sorted(known))}.")
-            thread = codex.thread_start(
-                approval_mode=ApprovalMode.deny_all, sandbox=Sandbox.read_only, cwd=session.root, model=model,
-                developer_instructions=system_text(engines.of(game), session.run_rel),
-                config=thread_config(spec, session.budget, os.environ.get("OPENAI_BASE_URL")), ephemeral=True)
-            stopped = run_turns(thread, message, events, session, t0 + session.budget, effort)
+        if chatgpt:
+            stopped = chatgpt_turns(session, spec, work, message, events, model)
+        else:
+            level = sessionmod.effort(model)
+            effort = ReasoningEffort(level) if level in {e.value for e in ReasoningEffort} else None
+            with Codex(CodexConfig(env=app_env(home, work), cwd=session.root)) as codex:
+                codex._client._approval_handler = decline  # (the SDK's own accepts commands and file changes)
+                codex.login_api_key(key)
+                known = known_models(codex)
+                if known is not None and model not in known:
+                    raise RuntimeError(f"Codex does not recognize model {model!r}. Set AUTOPILOT_MODEL to one of "
+                                       f"{', '.join(sorted(known))}.")
+                thread = codex.thread_start(
+                    approval_mode=ApprovalMode.deny_all, sandbox=Sandbox.read_only, cwd=session.root, model=model,
+                    developer_instructions=system_text(engines.of(game), session.run_rel),
+                    config=thread_config(spec, session.budget, os.environ.get("OPENAI_BASE_URL")), ephemeral=True)
+                stopped = run_turns(thread, message, events, session, t0 + session.budget, effort)
     except Exception as e:
         stopped = f"{type(e).__name__}: {e}"
         session.note(traceback.format_exc())
@@ -295,6 +330,7 @@ def implement(game, project, prompt, run_id=None, say=None, client=None, model=N
             game.pause(False)
         except Exception:
             pass
-    return sessionmod.finish(session, t0, stopped, events.last_text, agent="codex", provider=PROVIDER, model=model,
+    return sessionmod.finish(session, t0, stopped, events.last_text, agent="codex", provider=PROVIDER,
+                             model=model or "Codex CLI default",
                              fast=False, tokens=events.tokens, turns=events.turns)
 

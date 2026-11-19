@@ -94,6 +94,19 @@ You can use Autopilot through Claude Code and/or Codex via our MCP server.
 2. To run the one-time setup, run `autopilot connect claude` for Claude Code or `autopilot connect codex` for Codex.
 3. Open Claude Code / Codex and prompt it to "Use Autopilot to ...".
 
+### Using your ChatGPT login for playtests
+
+This checkout can use the Codex CLI for the coding agent, in-game decisions and frame reviews. Install this
+checkout into the Python environment that runs the agent service. Sign in to the Codex CLI with ChatGPT,
+then run `autopilot connect codex --use-chatgpt`. This selects the Codex agent and saves
+`AUTOPILOT_DECISION_PROVIDER=codex` in Autopilot’s user settings. Reconnect the editor after updating a running
+service. The Unity plugin and the MCP tool names stay the same.
+
+Codex calls use your ChatGPT plan and send the selected game observations or frames to OpenAI. A decision can
+take several seconds. Use harness executors for continuous movement, collision checks and input timing. Recorded
+replays can still run offline. To select the original decision provider again, remove `AUTOPILOT_DECISION_PROVIDER`
+from `autopilot.env` and configure your preferred account or keys in the editor.
+
 ## Things to Know
 
 An Autopilot prompt is one of 4 types:

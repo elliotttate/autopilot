@@ -20,7 +20,7 @@ import time
 
 import requests
 
-from . import vision
+from . import codex_login, vision
 
 # The cheaper model of each provider's family that reads code well enough to answer about it (None: the agent's own)
 HELPER = {"anthropic": "claude-sonnet-5-5", "opencode": "claude-sonnet-5-5",
@@ -40,19 +40,22 @@ class Model:
         self.provider = provider
         self.agent_model = agent_model
         self.route, self.unavailable = vision.route(provider, agent_model)
-        if self.route is not None:
+        if self.route is not None and self.route[0] != "codex":
             wire, root, key, _, path = self.route
             chosen = (os.environ.get("AUTOPILOT_HELPER_MODEL") or "").strip() or HELPER.get(provider) or agent_model
             self.route = (wire, root, key, chosen or agent_model, path)
         self.usage = usage
         self.proxied = proxied
         self.lock = threading.Lock()
+        self.stopped = threading.Event()
         # Every call's tokens by model, whoever else counts them: the report's reading_usage (what the brain's own
         # reading cost the run, apart from the agent's)
         self.tokens = {}
 
     @property
     def name(self):
+        if self.route and self.route[0] == "codex":
+            return self.route[3] or "Codex CLI default"
         return self.route[3] if self.route else None
 
     def ask(self, prompt, system=None, max_tokens=MAX_TOKENS):
@@ -68,6 +71,8 @@ class Model:
         if self.route is None:
             raise RuntimeError(f"no model to read with: {self.unavailable}")
         wire = self.route[0]
+        if wire == "codex":
+            return self._codex(messages, system, tools, max_tokens)
         try:
             return self._anthropic(messages, system, tools, max_tokens) if wire == "anthropic" else \
                 self._openai(messages, system, tools, max_tokens)
@@ -77,6 +82,45 @@ class Model:
             with self.lock:  # (the cheaper model isn't served here: the agent's own for the rest of the run)
                 self.route = self.route[:3] + (self.agent_model,) + self.route[4:]
             return self.turn(messages, system, tools, max_tokens)
+
+    def _codex(self, messages, system, tools, max_tokens):
+        # This process only chooses tool calls. The run's existing researcher
+        # executes the allowed names against its scoped read-only game files.
+        prompt = ([system] if system else []) + [f"Keep the answer within {max_tokens} tokens."]
+        options = {name: {"description": desc, "parameters": spec} for name, desc, spec in tools or ()}
+        schema = None
+        if options:
+            prompt += ["Request any necessary tools from the list below. For each call, put its JSON object of "
+                       "arguments in the arguments_json string. The host executes the calls and returns their "
+                       "results in the conversation. Finish with your answer in text and an empty calls list.",
+                       json.dumps(options, ensure_ascii=False)]
+            call = {"type": "object", "properties": {"name": {"type": "string", "enum": list(options)},
+                    "arguments_json": {"type": "string"}}, "required": ["name", "arguments_json"],
+                    "additionalProperties": False}
+            schema = {"type": "object", "properties": {"text": {"type": "string"},
+                      "calls": {"type": "array", "items": call}}, "required": ["text", "calls"],
+                      "additionalProperties": False}
+        prompt += ["Conversation in chronological order:", json.dumps(messages, ensure_ascii=False)]
+        reply = codex_login.ask("\n\n".join(prompt), schema=schema, timeout=TIMEOUT,
+                                model=self.route[3], stop=self.stopped)
+        with self.lock:
+            self.tokens.setdefault(self.name, {"calls": 0})["calls"] += 1
+        calls = []
+        if options:
+            response = json.loads(reply)
+            text = response["text"]
+            for index, request in enumerate(response["calls"]):
+                name = request["name"]
+                args = json.loads(request["arguments_json"])
+                if name not in options or not isinstance(args, dict):
+                    raise ValueError("Codex returned an invalid reading tool call")
+                spec = options[name]["parameters"]
+                if not set(spec.get("required", ())).issubset(args):
+                    raise ValueError(f"Codex omitted a required argument of {name}")
+                calls.append({"id": f"reading-{len(messages)}-{index}", "name": name, "args": args})
+        else:
+            text = reply
+        return {"text": text, "calls": calls, "message": {"role": "assistant", "content": text, "calls": calls}}
 
     def _anthropic(self, messages, system, tools, max_tokens):
         import anthropic
@@ -295,4 +339,6 @@ class Reader:
         return job
 
     def close(self):
+        if isinstance(self.model, Model):
+            self.model.stopped.set()
         self.pool.shutdown(wait=False, cancel_futures=True)

@@ -21,6 +21,7 @@ AUTOPILOT_SANDBOX: "auto" (default: bubblewrap where available, else a plain chi
 process: it keeps the keys from model-written code, but not the network or the disk.
 """
 
+import base64
 import concurrent.futures as futures
 import io
 import itertools
@@ -89,6 +90,8 @@ class Sandbox:
     def __init__(self, link, client, project, prompt, run_id, root, memory, scrub=None, recorder=None, level=None,
                  say=None, activity=None, looker=None):
         self.link, self.client = link, client
+        self.codex = getattr(client, "decision_provider", None) == "codex"
+        self.decision_stops = {}
         self.recorder = recorder  # (the run's media.Recorder: the episodes the child plays mark their videos on it)
         self.reader = None  # (the run's llm.Reader: the child's llm and llm_map calls; set by the parent's session)
         self.looker = looker  # (the run's watch.Looker: the child's looks at the picture while its harness plays)
@@ -112,7 +115,7 @@ class Sandbox:
                                      bufsize=0)
         self._write({"type": "init", "project": project, "prompt": prompt, "run_id": run_id,
                      "hello": getattr(link, "hello", None) or {}, "loopback": bool(getattr(link, "loopback", False)),
-                     "level": level,
+                     "level": level, "codex_decisions": self.codex,
                      # (whether the child's runtime may look at the picture: why not, or None)
                      "watch": looker.available() if looker is not None else "no looker in this run"})
         self.listener = lambda event: self._write({"type": "event", "event": event})
@@ -152,12 +155,20 @@ class Sandbox:
                 except Exception:
                     pass
             elif kind == "jev":
+                if self.codex:
+                    self.decision_stops[msg["rid"]] = threading.Event()
                 self.pool.submit(self._jev, msg)
+            elif kind == "cancel_decision":
+                event = self.decision_stops.get(msg.get("rid"))
+                if event is not None:
+                    event.set()
             elif kind == "episode":
                 self.pool.submit(self._episode, msg)
             elif kind == "llm":
                 self.pool.submit(self._llm, msg)
             elif kind == "watch":
+                if self.codex and msg.get("op") == "look":
+                    self.decision_stops[msg["rid"]] = threading.Event()
                 self.pool.submit(self._watch, msg)
             elif kind == "send":
                 try:
@@ -176,6 +187,7 @@ class Sandbox:
                         self.activity(**msg["event"])
                     except Exception:
                         pass
+        self._cancel_decisions()
         for entry in list(self.calls.values()):
             entry[0].set()
 
@@ -234,9 +246,13 @@ class Sandbox:
         try:
             if self.looker is None:
                 raise RuntimeError("no looker in this run")
-            reply = {"type": "res", "rid": msg["rid"], "ok": True, "result": watch.serve(self.looker, msg)}
+            event = self.decision_stops.get(msg["rid"])
+            answer = watch.serve(self.looker, msg, stop=event.is_set if event is not None else None)
+            reply = {"type": "res", "rid": msg["rid"], "ok": True, "result": answer}
         except Exception as e:
             reply = {"type": "res", "rid": msg["rid"], "ok": False, "error": f"{type(e).__name__}: {e}"[:500]}
+        finally:
+            self.decision_stops.pop(msg["rid"], None)
         self._write(reply)
 
     def _jev(self, msg):
@@ -246,8 +262,14 @@ class Sandbox:
 
         kinds = {"choice": Choice, "noul": Noul, "score": Score}
         try:
-            questions = {k: kinds[d.get("type", "choice")].model_validate(d) for k, d in msg["questions"].items()}
-            r = self.client.system_one(state=msg["state"], questions=questions)
+            if self.codex:
+                # Only pixels cross the boundary. Child-provided file names never become host attachments.
+                images = [base64.b64decode(data, validate=True) for data in msg.get("images", [])]
+                r = self.client.system_one(state=msg["state"], questions=msg["questions"], images=images,
+                                           stop=self.decision_stops[msg["rid"]])
+            else:
+                questions = {k: kinds[d.get("type", "choice")].model_validate(d) for k, d in msg["questions"].items()}
+                r = self.client.system_one(state=msg["state"], questions=questions)
             out = {"choices": {k: {"choice": a.choice, "probabilities": dict(getattr(a, "probabilities", None) or {}),
                                    "confidence": getattr(a, "confidence", None)} for k, a in r.choices.items()},
                    "nouls": {k: a.noul for k, a in r.nouls.items()},
@@ -257,7 +279,13 @@ class Sandbox:
             reply = {"type": "res", "rid": msg["rid"], "ok": True, "result": out}
         except Exception as e:
             reply = {"type": "res", "rid": msg["rid"], "ok": False, "error": f"{type(e).__name__}: {e}"[:500]}
+        finally:
+            self.decision_stops.pop(msg["rid"], None)
         self._write(reply)
+
+    def _cancel_decisions(self):
+        for event in list(self.decision_stops.values()):
+            event.set()
 
     def call(self, method, timeout=None, **kwargs):
         """Run Session.<method>(**kwargs) in the child; returns its reply's value."""
@@ -278,13 +306,16 @@ class Sandbox:
         return reply.get("value")
 
     def stop(self):
+        self._cancel_decisions()
         self._write({"type": "stop"})
 
     def end_episode(self):
         """Ends the episode running in the child now (the user redirected), not the run."""
+        self._cancel_decisions()
         self._write({"type": "end_episode"})
 
     def close(self):
+        self._cancel_decisions()
         if isinstance(getattr(self.link, "listeners", None), list) and self.listener in self.link.listeners:
             self.link.listeners.remove(self.listener)
         try:
@@ -328,14 +359,22 @@ class ProxyLink:
         self.pending = {}
         self.ids = itertools.count(1)
 
-    def _ask(self, msg, timeout=None):
+    def _ask(self, msg, timeout=None, stop=None):
         rid = next(self.ids)
         entry = [threading.Event(), None]
         self.pending[rid] = entry
         msg["rid"] = rid
         self.out(msg)
         try:
-            if not entry[0].wait(timeout or 120):
+            if stop is not None:
+                deadline = time.monotonic() + (timeout or 120)
+                while not entry[0].is_set() and time.monotonic() < deadline:
+                    if stop():
+                        self.out({"type": "cancel_decision", "rid": rid})
+                        raise InterruptedError("Episode ended during a decision")
+                    entry[0].wait(0.1)
+                timeout = 0
+            if not entry[0].wait(timeout if timeout is not None else 120):
                 import requests
 
                 raise requests.ConnectionError(f"no answer to {msg.get('op') or msg.get('type')} in time")
@@ -382,12 +421,23 @@ class ProxyLink:
 class RemoteJev:
     """A Jev client whose questions the parent asks (the child has no key)."""
 
-    def __init__(self, link):
+    def __init__(self, link, codex=False):
         self.link = link
+        self.decision_provider = "codex" if codex else "jev"
 
-    def system_one(self, state, questions):
-        dumps = {k: q.model_dump(mode="json", exclude_none=True) for k, q in questions.items()}
-        r = self.link._ask({"type": "jev", "state": state, "questions": dumps}, timeout=10)
+    def system_one(self, state, questions, *, images=(), stop=None):
+        if self.decision_provider == "codex":
+            from . import codex_decisions
+
+            pixels = list(images)
+            state = codex_decisions.freeze(state, pixels)
+            dumps = codex_decisions.questions_as_data(questions, pixels)
+            r = self.link._ask({"type": "jev", "state": state, "questions": dumps,
+                                "images": [base64.b64encode(image).decode("ascii") for image in pixels]},
+                               timeout=codex_decisions.TIMEOUT + 4, stop=stop)
+        else:
+            dumps = {k: q.model_dump(mode="json", exclude_none=True) for k, q in questions.items()}
+            r = self.link._ask({"type": "jev", "state": state, "questions": dumps}, timeout=10)
         if not r.get("ok"):
             raise RuntimeError(r.get("error") or "Jev failed")
         res = r["result"]
@@ -475,7 +525,8 @@ def child_main():
 
     game = Game(link, codexmod.Codex.for_project(init["project"]))
     game.level = init.get("level")  # (the run's level: restarts start it over)
-    session = Session(game, init["project"], init["prompt"], init["run_id"], say=link.status, client=RemoteJev(link))
+    decider = RemoteJev(link, codex=init.get("codex_decisions", False))
+    session = Session(game, init["project"], init["prompt"], init["run_id"], say=link.status, client=decider)
     session.forward = lambda event: out({"type": "activity", "event": event})  # (the parent's feed has it)
     session.stop = stopped.is_set
     session.budget = 0  # (the run's time is the parent's: it closes play itself, and gives episodes their end)
@@ -483,7 +534,8 @@ def child_main():
     session.reader = RemoteReader(link)
     from .watch import RemoteLooker
 
-    session.looker = RemoteLooker(link, available=init.get("watch", "no looker in this run"))
+    session.looker = RemoteLooker(link, available=init.get("watch", "no looker in this run"),
+                                  codex=init.get("codex_decisions", False))
     pool = futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="call")
 
     def run_call(msg):

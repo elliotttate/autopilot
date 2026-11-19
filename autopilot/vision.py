@@ -29,6 +29,8 @@ import time
 
 import requests
 
+from . import codex_login
+
 # The vision model, on Anthropic (direct, through Aura when Aura names none, through OpenCode Zen). Of the models
 # Aura's relay has a price for (it refuses others), Opus 5.5 is the one that described game frames without misreading
 # them (2026-10-19: Sonnet 5 made up an animation and guessed a covered digit). A run through Aura uses the model Aura
@@ -86,6 +88,14 @@ def route(provider, agent_model=None, model=None):
     """(wire, API root, key, model, path) that describe frames for an agent on provider, else (None, why). model: the
     one Aura named for the run, used whatever AUTOPILOT_VISION_MODEL and the provider's default say (Aura's relay
     refuses any other)."""
+    if provider == "codex" or codex_login.active():
+        if problem := codex_login.unavailable():
+            return None, problem
+        # CLI default is represented by no --model argument. An Aura model name
+        # or vision model picked for some other provider does not select it.
+        chosen = (os.environ.get("AUTOPILOT_CODEX_MODEL") or "").strip() or (
+            os.environ.get("AUTOPILOT_MODEL") or "").strip() or None
+        return ("codex", None, None, chosen, None), None
     if provider in NO_VISION:
         return None, NO_VISION[provider]
     if provider not in ROUTES:
@@ -337,6 +347,18 @@ class Wire:
     def ask(self, parts, system, max_tokens=MAX_TOKENS, effort=EFFORT):
         """(the model's text, the model that answered, its usage)."""
         wire, root, key, model, path = self.route
+        if wire == "codex":
+            prompt, images = [system, f"Keep the response within {max_tokens} tokens."], []
+            for kind, value in parts:
+                if kind == "text":
+                    prompt.append(value)
+                elif kind == "image":
+                    images.append(base64.b64decode(value, validate=True))
+                    prompt.append(f"[Attached image {len(images)}]")
+                else:
+                    raise ValueError(f"Unsupported vision input: {kind}")
+            answer = codex_login.ask("\n\n".join(prompt), images=images, timeout=TIMEOUT, model=model)
+            return answer, model or "Codex CLI default", None
         if wire == "anthropic":
             try:
                 return self._anthropic(root, key, model, parts, system, max_tokens, effort)

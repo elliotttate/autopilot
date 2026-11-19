@@ -17,6 +17,7 @@ from collections import Counter, defaultdict, deque
 
 from typesafe_sdk import Choice, RetryPolicy
 
+from . import codex_decisions, codex_login
 from .kit.geom import Vec, wrap
 from .kit.harness import Harness, Option, Status, Step
 
@@ -71,11 +72,14 @@ def jev_client(warm=True):
     WARM_EVERY: a decision made after an idle stretch, a dodge, never waits on a new connection or a server waking.
     Bodies go uncompressed: the SDK zstd-compresses them wherever zstd is importable (Python 3.14+), and Aura's relay
     doesn't pass Content-Encoding on to TypeSafe."""
-    import httpx2
     from dotenv import load_dotenv
-    from typesafe_sdk import TypeSafeClient
 
     load_dotenv()
+    if codex_login.active():
+        return codex_decisions.CodexDecisions()
+    import httpx2
+    from typesafe_sdk import TypeSafeClient
+
     used = [time.monotonic()]
     http = httpx2.Client(timeout=1.0, limits=httpx2.Limits(keepalive_expiry=KEEPALIVE),
                          event_hooks={"request": [lambda request: used.__setitem__(0, time.monotonic())]})
@@ -223,6 +227,9 @@ class Runtime:
         self.log_before = game.log  # given back when the episode ends (probes after it log there)
         self.game.log = self.log
         self.client = client
+        self.decision_provider = getattr(client, "decision_provider", "jev" if client is not None else "none")
+        self.codex = self.decision_provider == "codex"
+        self.decision_stop = threading.Event()
         self.max_seconds = max_seconds
         self.say = say or (lambda text: None)  # progress in words (the Autopilot tab's status line)
         self.stop = stop or (lambda: False)  # an outside request to stop
@@ -268,10 +275,12 @@ class Runtime:
         if self.running:
             now_doing = {"option": self.running.option.name,
                          "for_seconds": round(self.game.t - self.running.t0, 1)}
+        images = []
+        capture = (lambda value: codex_decisions.freeze(value, images)) if self.codex else jsonable
         state = {
             "goal": h.goal,
-            "situation": jsonable(h.facts(obs)),
-            "options": {o.name: jsonable(o.facts) for o in opts},
+            "situation": capture(h.facts(obs)),
+            "options": {o.name: capture(o.facts) for o in opts},
             "now_doing": now_doing,
             "recent": list(self.recent),
         }
@@ -288,14 +297,19 @@ class Runtime:
         asked = time.monotonic()
         self.call_ids += 1
         meta = {"call": self.call_ids, "wall": round(time.time(), 3), "options": names}
+        if self.codex:
+            questions = codex_decisions.questions_as_data(questions, images)
+            sent = {"state": state, "questions": questions}
+        else:
+            sent = {"state": state,
+                    "questions": {k: q.model_dump(mode="json", exclude_none=True) for k, q in questions.items()}}
 
         def call():
-            r = self.client.system_one(state=state, questions=questions)
+            kwargs = {"images": images, "stop": self.decision_stop.is_set} if self.codex else {}
+            r = self.client.system_one(state=state, questions=questions, **kwargs)
             return r, time.monotonic() - asked
 
         fut = self.pool.submit(call)
-        sent = {"state": state,
-                "questions": {k: q.model_dump(mode="json", exclude_none=True) for k, q in questions.items()}}
         self.pending.append((fut, asked, names, t, sent, meta))
         self.last_ask = asked
 
@@ -307,7 +321,8 @@ class Runtime:
         for item in self.pending:
             fut = item[0]
             if not fut.done():
-                if time.monotonic() - item[1] > JEV_TIMEOUT * 2.5:
+                deadline = codex_decisions.TIMEOUT + 5 if self.codex else JEV_TIMEOUT * 2.5
+                if time.monotonic() - item[1] > deadline:
                     self.trace("jev_error", error="no answer in time", t=self.game.t, call=item[5]["call"])
                     self.keep_call(item, error="no answer in time")
                     continue  # forget it
@@ -316,7 +331,7 @@ class Runtime:
             try:
                 r, latency = fut.result()
             except Exception as e:
-                self.errors[f"jev: {type(e).__name__}"] += 1
+                self.errors[f"{self.decision_provider}: {type(e).__name__}"] += 1
                 self.trace("jev_error", error=f"{type(e).__name__}: {e}", t=self.game.t, call=item[5]["call"])
                 self.keep_call(item, error=f"{type(e).__name__}: {e}")
                 continue
@@ -505,6 +520,17 @@ class Runtime:
     def apply(self, probs, extra, latency, opts_now, obs, asked_t, state, meta=None):
         self.decisions += 1
         by_name = {o.name: o for o in opts_now}
+        if self.codex:
+            asked_step = ((state["state"].get("plan") or {}).get("now") or {}).get("step")
+            step = self.current_step()
+            if probs.keys() != by_name.keys() or asked_step != (step.name if step else None):
+                # A CLI turn can span a door opening or a plan step ending. Ask about the new state.
+                self.trace("decision", t=asked_t, applied_t=self.game.t, latency=round(latency, 3), probs=probs,
+                           chosen=None, action="dropped", provider="codex", reason="options or step changed")
+                if meta:
+                    self.keep_call((None, None, None, asked_t, state, meta), action="dropped", chosen=None,
+                                   response=meta.get("response"))
+                return
         live = {k: v for k, v in probs.items() if k in by_name}
         action = "dropped"
         chosen = max(live, key=live.get) if live else None
@@ -531,6 +557,7 @@ class Runtime:
                 action = "kept_running"
         meta = meta or {}
         self.trace("decision", t=asked_t, applied_t=self.game.t, latency=round(latency, 3), probs=probs,
+                   provider=self.decision_provider,
                    extra=extra, chosen=chosen, action=action, state=state.get("state"), call=meta.get("call"))
         if meta:
             self.keep_call((None, None, None, asked_t, state, meta), latency_s=round(latency, 4),
@@ -547,7 +574,8 @@ class Runtime:
         allowed = getattr(link, "loopback", False) or os.environ.get("AUTOPILOT_INSPECT") == "1"
         if not hello.get("inspect") or not allowed:
             return
-        frame = {"type": "jev", "call": self.decisions, "kind": "play", "step": self.decisions, "t": asked_t,
+        frame = {"type": "jev", "provider": self.decision_provider, "call": self.decisions, "kind": "play",
+                 "step": self.decisions, "t": asked_t,
                  "wall": time.time(), "goal": self.h.goal,
                  "plan_step": self.running.option.description[:120] if self.running else None,
                  "seconds": {"jev": round(latency, 3), "decide": round(latency, 3)},
@@ -690,6 +718,7 @@ class Runtime:
         try:
             return self._run()
         finally:
+            self.decision_stop.set()
             if isinstance(listeners, list) and self.on_event in listeners:
                 listeners.remove(self.on_event)
 
@@ -706,7 +735,7 @@ class Runtime:
         g, h = self.game, self.h
         trace_every = trace_every_of(h)
         self.trace("start", harness=type(h).__name__, goal=h.goal, tempo=h.tempo, tick_hz=h.tick_hz,
-                   trace_every=trace_every, max_seconds=self.max_seconds)
+                   trace_every=trace_every, max_seconds=self.max_seconds, decision_provider=self.decision_provider)
         self.still("episode_start")
         end = {"reason": "", "status": None}
         try:
@@ -867,7 +896,10 @@ class Runtime:
                 self.last_names = names
                 due = (self.running is None or changed
                        or (h.tempo > 0 and now - self.last_ask >= 1.0 / h.tempo))
-                if due and len(self.pending) < MAX_IN_FLIGHT and now - self.last_ask >= MIN_ASK_GAP:
+                gap = codex_decisions.MIN_INTERVAL if self.codex else MIN_ASK_GAP
+                capacity = 1 if self.codex else MAX_IN_FLIGHT
+                can_ask = len(self.pending) < capacity and now - self.last_ask >= gap
+                if due and (can_ask or (self.codex and len(opts) == 1 and self.running is None)):
                     if len(opts) == 1 and self.running is None:
                         self.start(opts[0], obs, p=1.0, why="the only option")
                         self.last_ask = now
@@ -935,6 +967,7 @@ class Runtime:
             self.error("idle", e)
 
     def finish(self, end, status, obs=None):
+        self.decision_stop.set()
         if self.running:
             self.stop_running(f"episode ended ({end['reason']})")
         self.settle_endings(obs)
@@ -1243,6 +1276,8 @@ def summarize(trace_path, error_log=False):
         return "(empty trace)"
     out = []
     start = next((e for e in events if e["kind"] == "start"), {})
+    decider = {"codex": "Codex", "recorded": "recorded replay", "none": "runtime"}.get(start.get("decision_provider"),
+                                                                                         "Jev")
     end = next((e for e in reversed(events) if e["kind"] == "end"), None)
     t_first = next((e.get("t") for e in events if e.get("t") is not None), 0) or 0
     out.append(f"Harness {start.get('harness')}  goal: {start.get('goal')!r}")
@@ -1250,7 +1285,7 @@ def summarize(trace_path, error_log=False):
         st = end.get("status") or {}
         out.append(f"Ended: {end.get('reason')} at t={end.get('t', 0) - t_first:.1f}s  status={st.get('state')} "
                    f"note={st.get('note')!r} evidence={json.dumps(st.get('evidence'))}")
-        out.append(f"Decisions by Jev: {end.get('decisions')}"
+        out.append(f"Decisions by {decider}: {end.get('decisions')}"
                    + (f"; deaths: {end.get('deaths')}" if end.get("deaths") else ""))
     else:
         out.append("Ended: (no end event: the run crashed or is still going)")
@@ -1361,13 +1396,13 @@ def summarize(trace_path, error_log=False):
     if dec:
         lat = sorted(d["latency"] for d in dec)
         acts = Counter(d["action"] for d in dec)
-        out.append(f"\nJev: {len(dec)} answers, latency median {lat[len(lat) // 2]:.2f}s; actions {dict(acts)}")
+        out.append(f"\n{decider}: {len(dec)} answers, latency median {lat[len(lat) // 2]:.2f}s; actions {dict(acts)}")
         first = dec[0]
-        out.append("First decision Jev saw (state): " + json.dumps(first.get("state")))
+        out.append(f"First decision {decider} saw (state): " + json.dumps(first.get("state")))
         out.append("Its answer: " + json.dumps(first.get("probs")))
     jerr = [e for e in events if e["kind"] == "jev_error"]
     if jerr:
-        out.append(f"Jev errors: {len(jerr)}: " + "; ".join(f"{w} x{n}" for w, n in
+        out.append(f"{decider} errors: {len(jerr)}: " + "; ".join(f"{w} x{n}" for w, n in
                                                          Counter(str(e.get("error")) for e in jerr).most_common()))
     errs = [e for e in events if e["kind"] == "error"]
     if errs:

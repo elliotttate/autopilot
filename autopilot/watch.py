@@ -122,6 +122,7 @@ class Looker:
                  named=False):
         self.frames = frames
         self.jev = jev
+        self.decision_provider = "codex" if getattr(jev, "decision_provider", None) == "codex" else "jev"
         self.route = route
         self.provider = provider
         self.usage = usage
@@ -130,7 +131,7 @@ class Looker:
         self.log = log
         self.jev_failed = 0  # Jev's answers about pictures failing in a row
         self.jev_error = None  # why Jev's last answer about pictures failed (for the trace, once)
-        self.calls = {"jev": 0, "model": 0, "describe": 0}
+        self.calls = {self.decision_provider: 0, "model": 0, "describe": 0}
         self.lock = threading.Lock()
 
     def available(self):
@@ -144,7 +145,7 @@ class Looker:
     def can_describe(self):
         return self.route is not None and self.frames is not None
 
-    def look(self, wall0, wall1, questions, facts=None, rate=RATE, limit=MAX_FRAMES):
+    def look(self, wall0, wall1, questions, facts=None, rate=RATE, limit=MAX_FRAMES, stop=None):
         """The answers to questions (ids to Noul/Choice/Score) about the frames captured from wall0 to wall1:
         {id: probability (Noul) | {label: probability} (Choice) | score (Score), "frames": [game times], "by":
         "jev"|"model", "latency", "note"? (the model's sentence)}. Raises when nothing could be looked at."""
@@ -159,14 +160,17 @@ class Looker:
         by = None
         if self.jev is not None and self.jev_failed < JEV_FAILURES:
             try:
-                answers = self._jev(frames[-JEV_FRAMES:], questions, facts)
-                by = "jev"
+                answers = self._jev(frames[-JEV_FRAMES:], questions, facts, stop)
+                by = self.decision_provider
                 self.jev_failed = 0
+            except InterruptedError:
+                raise
             except Exception as e:  # noqa: BLE001 - the vision model answers instead
                 self.jev_failed += 1
                 self.jev_error = f"{type(e).__name__}: {str(e)[:200]}"
                 if self.route is None:
-                    raise RuntimeError(f"Jev couldn't answer about the frames: {type(e).__name__}: {e}") from None
+                    raise RuntimeError(f"{self.decision_provider.title()} couldn't answer about the frames: "
+                                       f"{type(e).__name__}: {e}") from None
         if answers is None:
             answers = self._model(frames, questions, facts)
             by = "model"
@@ -199,7 +203,7 @@ class Looker:
 
     # -- the two ways of asking ------------------------------------------------------------------------------
 
-    def _jev(self, frames, questions, facts):
+    def _jev(self, frames, questions, facts, stop=None):
         """Jev's answers: the frames go as image assets in the state (TypeSafe's System One), with the facts."""
         from typesafe_sdk import Image
 
@@ -210,8 +214,9 @@ class Looker:
         if facts:
             state["situation"] = facts
         # (TypeSafe takes images only with this header: "Images are experimental", its 400 says without it)
+        kwargs = {"stop": stop} if self.decision_provider == "codex" else {}
         r = self.jev.system_one(state=state, questions=questions,
-                                extra_headers={"TypeSafe-Danger-Zone-Images": "true"})
+                                extra_headers={"TypeSafe-Danger-Zone-Images": "true"}, **kwargs)
         out = {}
         for k, a in r.nouls.items():
             out[k] = float(a.noul)
@@ -221,7 +226,7 @@ class Looker:
         for k, a in r.scores.items():
             out[k] = float(a.score)
         with self.lock:
-            self.calls["jev"] += 1
+            self.calls[self.decision_provider] += 1
         return out
 
     def _model(self, frames, questions, facts):
@@ -316,8 +321,9 @@ def _prob(v):
 class RemoteLooker:
     """The Looker in the sandbox's child: the parent looks (autopilot/sandbox.py, "watch" messages)."""
 
-    def __init__(self, link, available=None):
+    def __init__(self, link, available=None, codex=False):
         self.link = link
+        self.decision_provider = "codex" if codex else "jev"
         self._available = available  # (why no look can be made, as the parent said at the start; None: it can)
 
     def available(self):
@@ -326,28 +332,30 @@ class RemoteLooker:
     def can_describe(self):
         return self._available is None
 
-    def _ask(self, msg, timeout):
-        r = self.link._ask({"type": "watch", **msg}, timeout=timeout)
+    def _ask(self, msg, timeout, stop=None):
+        kwargs = {"stop": stop} if stop is not None else {}
+        r = self.link._ask({"type": "watch", **msg}, timeout=timeout, **kwargs)
         if not r.get("ok"):
             raise RuntimeError(r.get("error") or "the look failed")
         return r.get("result")
 
-    def look(self, wall0, wall1, questions, facts=None, rate=RATE, limit=MAX_FRAMES):
+    def look(self, wall0, wall1, questions, facts=None, rate=RATE, limit=MAX_FRAMES, stop=None):
         return self._ask({"op": "look", "wall0": wall0, "wall1": wall1, "questions": jsonable_questions(questions),
-                          "facts": facts, "rate": rate, "limit": limit}, timeout=TIMEOUT + 10)
+                          "facts": facts, "rate": rate, "limit": limit}, timeout=TIMEOUT + 10, stop=stop)
 
     def describe(self, wall0, wall1, question=REVIEW_QUESTION, rate=RATE, limit=MAX_FRAMES):
         return self._ask({"op": "describe", "wall0": wall0, "wall1": wall1, "question": question, "rate": rate,
                           "limit": limit}, timeout=TIMEOUT + 10)
 
 
-def serve(looker, msg):
+def serve(looker, msg, stop=None):
     """A RemoteLooker's message answered by the parent's looker: the result (the parent's sandbox calls this)."""
     op = msg.get("op")
     if op == "look":
+        kwargs = {"stop": stop} if stop is not None else {}
         return looker.look(float(msg["wall0"]), float(msg["wall1"]), questions_from(msg.get("questions")),
                            facts=msg.get("facts"), rate=float(msg.get("rate") or RATE),
-                           limit=int(msg.get("limit") or MAX_FRAMES))
+                           limit=int(msg.get("limit") or MAX_FRAMES), **kwargs)
     if op == "describe":
         return looker.describe(float(msg["wall0"]), float(msg["wall1"]), question=msg.get("question") or
                                REVIEW_QUESTION, rate=float(msg.get("rate") or RATE),
@@ -513,7 +521,9 @@ class Watcher:
         questions = self._questions()
         t = self.game.t
         try:
-            answers = self.looker.look(wall0, wall1, questions, facts=self.facts, rate=rate)
+            codex = getattr(self.looker, "decision_provider", None) == "codex"
+            kwargs = {"stop": lambda: self.stopped} if codex else {}
+            answers = self.looker.look(wall0, wall1, questions, facts=self.facts, rate=rate, **kwargs)
         except Exception as e:  # noqa: BLE001 - told once in the trace, then the watcher goes on
             self.failures += 1
             if self.failures <= 2:
