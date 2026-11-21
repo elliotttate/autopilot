@@ -364,14 +364,20 @@ class Game:
         """What the game's plugin does beyond the protocol's first version (its hello's "features")."""
         return set((getattr(self.link, "hello", None) or {}).get("features") or [])
 
-    def hold_timed(self, key, seconds, value=None):
+    def hold_timed(self, key, seconds, value=None, *, span=None, brake=0.0, drift=10.0):
         """Hold a key for `seconds` of game time, let go by the game itself (exact, however late the brain is), when
-        the plugin can (False: it can't, or the key is an input action; then hold() and release() it)."""
-        if key.startswith("/") or "timed_hold" not in self.features:
+        the plugin can. With `span=(start, end)` (kit world points), also let go within `brake` cm of the end plane
+        or more than `drift` cm sideways from the line. False means the plugin cannot provide the requested hold."""
+        features = self.features
+        if key.startswith("/") or "timed_hold" not in features or (span is not None and "hold_span" not in features):
             return False
         args = {"key": key, "mode": "hold", "seconds": float(seconds), "lease": KEY_LEASE}
         if value is not None:
             args["value"] = value
+        if span is not None:
+            start, end = span
+            args["span"] = {"start": Vec.of(start).ue(), "end": Vec.of(end).ue(),
+                            "brake": float(brake), "drift": float(drift)}
         self.post("key", args)
         self.log("input", key=key, mode="hold", value=value, seconds=seconds)
         return True

@@ -31,6 +31,21 @@ class PointerLink:
         self.request(op, args)
 
 
+def test_guarded_hold_requires_bridge_support_and_preserves_its_endpoint():
+    from autopilot.kit.game import KEY_LEASE, Game
+
+    link = PointerLink()
+    game = Game(link)
+    span = ((100, -20, 300), (135, -20, 301))
+    assert game.hold_timed("W", 0.1, span=span, brake=2.5) is False
+    assert not link.asked
+    link.hello = {**link.hello, "features": [*link.hello["features"], "hold_span"]}
+    assert game.hold_timed("W", 0.1, span=span, brake=2.5) is True
+    assert link.asked == [("key", {"key": "W", "mode": "hold", "seconds": 0.1, "lease": KEY_LEASE,
+                                  "span": {"start": {"X": 100, "Y": -20, "Z": 300},
+                                           "end": {"X": 135, "Y": -20, "Z": 301}, "brake": 2.5, "drift": 10}})]
+
+
 def test_pointer_goes_to_a_screen_place_a_world_point_or_an_object():
     from autopilot.kit.game import Game
     from autopilot.kit.geom import Vec

@@ -664,7 +664,7 @@ namespace Autopilot.Playtest
         /// <summary>The hello's features: `trace` with 3D physics, `media` when the capture code is compiled in.</summary>
         static List<object> Features()
         {
-            var features = new List<object> { "timed_hold", "pointer", "levels" };
+            var features = new List<object> { "timed_hold", "hold_span", "pointer", "levels" };
 #if AUTOPILOT_PHYSICS
             features.Add("trace");
 #endif

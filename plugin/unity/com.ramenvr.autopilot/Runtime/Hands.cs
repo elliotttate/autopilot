@@ -753,6 +753,58 @@ namespace Autopilot.Playtest
             public string Owner;  // "key" (the brain's), "input:<action>", "move"
             public bool Leased;  // let go when not renewed (the key op's holds, actions held through it too)
             public double Until;  // a timed hold: let go at this game time (Time.timeAsDouble), needing no renewal; 0: none
+            public HoldSpan Span;
+        }
+
+        sealed class HoldSpan
+        {
+            readonly GameObject player;
+            readonly int scene;
+            readonly Vector3 start, end, direction;
+            readonly float length, brake, drift;
+
+            HoldSpan(GameObject player, Vector3 start, Vector3 end, Vector3 delta, float length, float brake, float drift)
+            {
+                this.player = player;
+                scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().handle;
+                this.start = start;
+                this.end = end;
+                direction = delta / length;
+                this.length = length;
+                this.brake = brake;
+                this.drift = drift;
+            }
+
+            static Vector3 ReadPoint(Dictionary<string, object> point) => Frame.ToUnity(
+                Json.Num(point, "X", double.NaN), Json.Num(point, "Y", double.NaN), Json.Num(point, "Z", double.NaN));
+
+            public static HoldSpan Read(Dictionary<string, object> args)
+            {
+                var start = ReadPoint(Json.Obj(args, "start"));
+                var end = ReadPoint(Json.Obj(args, "end"));
+                var brake = (float)(Json.Num(args, "brake", 0) / Frame.Scale);
+                var drift = (float)(Json.Num(args, "drift", 10) / Frame.Scale);
+                var delta = end - start;
+                delta.y = 0;
+                var length = delta.magnitude;
+                if (!Frame.Finite(start) || !Frame.Finite(end) || !Frame.Finite(new Vector3(length, brake, drift)) ||
+                    length <= 0 || brake < 0 || brake >= length || drift <= 0) return null;
+                var player = Player.Find();
+                return player == null ? null : new HoldSpan(player, start, end, delta, length, brake, drift);
+            }
+
+            public bool Stop()
+            {
+                if (player == null || !player.activeInHierarchy || Player.Find() != player ||
+                    UnityEngine.SceneManagement.SceneManager.GetActiveScene().handle != scene) return true;
+                var at = Player.Position(player);
+                var offset = at - start;
+                var progress = Vector3.Dot(offset, direction);
+                var cross = offset.x * direction.z - offset.z * direction.x;
+                var height = Mathf.Lerp(start.y, end.y, progress / length);
+                return !Frame.Finite(at) || progress >= length - brake || progress < -drift ||
+                    Mathf.Abs(cross) > drift || Mathf.Abs(at.y - height) > 0.75f;
+            }
         }
 
         static readonly Dictionary<string, Held> held = new Dictionary<string, Held>();
@@ -819,7 +871,8 @@ namespace Autopilot.Playtest
             foreach (var pair in held.ToList())
             {
                 var h = pair.Value;
-                if (h.Until > 0 ? Time.timeAsDouble >= h.Until : (h.Owner == "key" || h.Leased) && now - h.Renewed > leaseSeconds)
+                bool expired = h.Until > 0 ? Time.timeAsDouble >= h.Until : (h.Owner == "key" || h.Leased) && now - h.Renewed > leaseSeconds;
+                if (expired || h.Span?.Stop() == true)
                 {
                     Release(pair.Key);
                     continue;
@@ -930,7 +983,7 @@ namespace Autopilot.Playtest
         }
 
         /// <summary>key: {"key", "mode": "press"|"hold"|"release"|"release_all", "value"?, "rate"?, "lease"?, "seconds"?}.
-        /// A hold with "seconds" (a timed hold) is let go after that much game time, without renewal.</summary>
+        /// A timed hold may also have "span" with start/end points in kit units and brake/drift distances in cm.</summary>
         public static void KeyOp(PlaytestClient client, long id, Dictionary<string, object> args)
         {
             var mode = Json.Str(args, "mode", "press");
@@ -945,12 +998,13 @@ namespace Autopilot.Playtest
                 return;
             }
             var name = Json.Str(args, "key");
+            var guarded = mode == "hold" && args.ContainsKey("span");
             if (!TryControl(name, out var c))
             {
 #if AUTOPILOT_INPUT_SYSTEM && ENABLE_INPUT_SYSTEM
                 // Not a key: an Input System action by name ("Player/Jump", "Jump"), as game.press / game.hold give them
                 var action = string.IsNullOrEmpty(name) ? null : FindAction(name);
-                if (action != null)
+                if (action != null && !guarded)
                 {
                     ActionDo(client, id, action, mode, ValueOf(args), false, true, seconds);
                     return;
@@ -970,10 +1024,27 @@ namespace Autopilot.Playtest
             }
             if (mode == "hold")
             {
+                var heldId = c.Id + "#key";
+                var span = guarded ? HoldSpan.Read(Json.Obj(args, "span")) : null;
+                if (guarded && (span == null || !(seconds > 0) || double.IsInfinity(seconds) || c.IsMouseMove))
+                {
+                    Release(heldId);
+                    client.RespondError(id, "A span requires a player, a valid span and a finite timed key or axis hold");
+                    return;
+                }
+                if (span?.Stop() == true)
+                {
+                    // A delayed request can arrive after the body has already left the checked span.
+                    Release(heldId);
+                    client.Respond(id, new Dictionary<string, object>());
+                    return;
+                }
                 // (the agent's key going down, for the teleport detector: not a renewal of one already held, not an axis)
-                if (!c.IsAxis && !held.ContainsKey(c.Id + "#key")) Detectors.NoteAgentInput(name);
+                if (!c.IsAxis && !held.ContainsKey(heldId)) Detectors.NoteAgentInput(name);
                 Hold(c, value, rate, "key");
-                held[c.Id + "#key"].Until = seconds > 0 ? Time.timeAsDouble + seconds : 0;
+                var heldKey = held[heldId];
+                heldKey.Until = seconds > 0 ? Time.timeAsDouble + seconds : 0;
+                heldKey.Span = span;
                 client.Respond(id, new Dictionary<string, object>());
                 return;
             }
