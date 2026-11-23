@@ -85,7 +85,9 @@ def ask(prompt, *, schema=None, images=(), timeout=60, stop=None, config=None, m
     cancelled = (stop.is_set if hasattr(stop, "is_set") else stop) or (lambda: False)
     if cancelled():
         raise InterruptedError("Codex request stopped")
-    with tempfile.TemporaryDirectory(prefix="autopilot-codex-turn-") as temp:
+    # A Codex helper can still hold the folder open when the turn ends (Windows: WinError 32), and a
+    # failed cleanup must not throw away an answer that has already arrived.
+    with tempfile.TemporaryDirectory(prefix="autopilot-codex-turn-", ignore_cleanup_errors=True) as temp:
         directory = Path(temp)
         final = directory / "answer.txt"
         args = [binary, "exec", "--ignore-user-config", "--ephemeral", "--sandbox", "read-only",
